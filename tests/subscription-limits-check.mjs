@@ -14,6 +14,14 @@ function matchesUsageWindow(window, expectedSeconds) {
   return Math.abs(window.windowSeconds - expectedSeconds) <= 120;
 }
 
+function parseCodexRateLimitState(rateLimit) {
+  if (!rateLimit || typeof rateLimit !== "object" || Array.isArray(rateLimit)) return undefined;
+  const allowed = typeof rateLimit.allowed === "boolean" ? rateLimit.allowed : undefined;
+  const limitReached = typeof rateLimit.limit_reached === "boolean" ? rateLimit.limit_reached : undefined;
+  if (allowed === undefined && limitReached === undefined) return undefined;
+  return { allowed, limitReached };
+}
+
 function parseCodexUsageSnapshot(data) {
   const rateLimit = data?.rate_limit || {};
   const windows = [
@@ -25,6 +33,7 @@ function parseCodexUsageSnapshot(data) {
     email: typeof data?.email === "string" ? data.email : "",
     fiveHour: windows.find((window) => matchesUsageWindow(window, 5 * 60 * 60)),
     weekly: windows.find((window) => matchesUsageWindow(window, 7 * 24 * 60 * 60)),
+    rateLimit: parseCodexRateLimitState(rateLimit),
   };
 }
 
@@ -36,7 +45,15 @@ function getCodexWindowRemaining(window) {
 function classifyCodexQuotaKind(snapshot) {
   const values = [getCodexWindowRemaining(snapshot.fiveHour), getCodexWindowRemaining(snapshot.weekly)]
     .filter((value) => value !== undefined);
-  if (values.length === 0) return { kind: "error", score: 0 };
+  if (values.length === 0) {
+    if (snapshot.rateLimit?.limitReached === true || snapshot.rateLimit?.allowed === false) {
+      return { kind: "blocked", score: 0 };
+    }
+    if (snapshot.rateLimit?.allowed === true || snapshot.rateLimit?.limitReached === false) {
+      return { kind: "ready", score: 100 };
+    }
+    return { kind: "error", score: 0 };
+  }
   const bottleneck = Math.min(...values);
   if (bottleneck <= 5) return { kind: "blocked", score: bottleneck };
   if (bottleneck <= 15) return { kind: "low", score: bottleneck };
@@ -197,6 +214,46 @@ function runWindowClassificationChecks() {
   assert.equal(getCodexWindowRemaining(snapshot.weekly), 65);
 }
 
+function runCurrentWhamUsageSchemaChecks() {
+  const snapshot = parseCodexUsageSnapshot({
+    plan_type: "team",
+    email: "test@example.com",
+    rate_limit: {
+      allowed: true,
+      limit_reached: false,
+      primary_window: {
+        used_percent: 0,
+        limit_window_seconds: 0,
+        reset_after_seconds: 0,
+        reset_at: 1780467085,
+      },
+      secondary_window: null,
+    },
+  });
+
+  assert.equal(snapshot.planType, "team");
+  assert.equal(snapshot.email, "test@example.com");
+  assert.equal(snapshot.fiveHour, undefined);
+  assert.equal(snapshot.weekly, undefined);
+  assert.deepEqual(snapshot.rateLimit, { allowed: true, limitReached: false });
+  assert.deepEqual(classifyCodexQuotaKind(snapshot), { kind: "ready", score: 100 });
+}
+
+function runCurrentWhamBlockedSchemaChecks() {
+  const snapshot = parseCodexUsageSnapshot({
+    rate_limit: {
+      allowed: false,
+      limit_reached: true,
+      primary_window: {
+        used_percent: 0,
+        limit_window_seconds: 0,
+      },
+    },
+  });
+
+  assert.deepEqual(classifyCodexQuotaKind(snapshot), { kind: "blocked", score: 0 });
+}
+
 function runSeverityChecks() {
   assert.equal(
     classifyCodexQuotaKind({ fiveHour: { usedPercent: 20 }, weekly: { usedPercent: 40 } }).kind,
@@ -309,6 +366,8 @@ function runDisplayNameChecks() {
 }
 
 runWindowClassificationChecks();
+runCurrentWhamUsageSchemaChecks();
+runCurrentWhamBlockedSchemaChecks();
 runSeverityChecks();
 runGoogleGeminiQuotaParsingChecks();
 runGoogleAntigravityQuotaParsingChecks();

@@ -306,11 +306,17 @@ interface CodexUsageWindow {
 	resetAt?: number;
 }
 
+interface CodexRateLimitState {
+	allowed?: boolean;
+	limitReached?: boolean;
+}
+
 interface CodexUsageSnapshot {
 	planType: string;
 	email: string;
 	fiveHour?: CodexUsageWindow;
 	weekly?: CodexUsageWindow;
+	rateLimit?: CodexRateLimitState;
 }
 
 interface GoogleGeminiQuotaResponse {
@@ -391,6 +397,15 @@ function normalizeCodexUsageWindow(window: unknown): CodexUsageWindow | undefine
 	};
 }
 
+function parseCodexRateLimitState(rateLimit: unknown): CodexRateLimitState | undefined {
+	const raw = getRecord(rateLimit);
+	if (!raw) return undefined;
+	const allowed = typeof raw.allowed === "boolean" ? raw.allowed : undefined;
+	const limitReached = typeof raw.limit_reached === "boolean" ? raw.limit_reached : undefined;
+	if (allowed === undefined && limitReached === undefined) return undefined;
+	return { allowed, limitReached };
+}
+
 function matchesUsageWindow(window: CodexUsageWindow | undefined, expectedSeconds: number): boolean {
 	if (!window) return false;
 	return Math.abs(window.windowSeconds - expectedSeconds) <= 120;
@@ -410,6 +425,7 @@ function parseCodexUsageSnapshot(data: unknown): CodexUsageSnapshot {
 		email: typeof raw?.email === "string" ? raw.email : "",
 		fiveHour,
 		weekly,
+		rateLimit: parseCodexRateLimitState(rateLimit),
 	};
 }
 
@@ -447,6 +463,14 @@ function formatResetLong(resetAt?: number): string {
 function formatRemainingPercent(value: number | undefined): string {
 	if (value === undefined) return "--";
 	return `${Math.round(value)}%`;
+}
+
+function formatCodexRateLimitState(state: CodexRateLimitState | undefined): string | undefined {
+	if (!state) return undefined;
+	const parts: string[] = [];
+	if (state.allowed !== undefined) parts.push(`allowed=${state.allowed}`);
+	if (state.limitReached !== undefined) parts.push(`limit_reached=${state.limitReached}`);
+	return parts.length > 0 ? parts.join(", ") : undefined;
 }
 
 function isAbortError(error: unknown): boolean {
@@ -489,6 +513,12 @@ function classifyCodexQuotaKind(snapshot: CodexUsageSnapshot): {
 	const weeklyLeft = getCodexWindowRemaining(snapshot.weekly);
 	const values = [fiveHourLeft, weeklyLeft].filter((value): value is number => value !== undefined);
 	if (values.length === 0) {
+		if (snapshot.rateLimit?.limitReached === true || snapshot.rateLimit?.allowed === false) {
+			return { kind: "blocked", score: 0 };
+		}
+		if (snapshot.rateLimit?.allowed === true || snapshot.rateLimit?.limitReached === false) {
+			return { kind: "ready", score: 100 };
+		}
 		return { kind: "error", score: 0 };
 	}
 	const bottleneck = Math.min(...values);
@@ -660,7 +690,7 @@ async function showWrappedSelect(
 ): Promise<string | undefined> {
 	if (options.items.length === 0) return undefined;
 
-	if (!ctx.hasUI) {
+	if (!ctx.hasUI || ctx.mode !== "tui") {
 		const renderedItems = options.items.map((item) =>
 			item.description ? `${item.label} — ${item.description}` : item.label,
 		);
@@ -759,7 +789,7 @@ async function loadQuotaResults(
 	ctx: ExtensionCommandContext,
 	accounts: QuotaAccount[],
 ): Promise<QuotaCheckResult[] | null> {
-	if (!ctx.hasUI) {
+	if (!ctx.hasUI || ctx.mode !== "tui") {
 		return runQuotaChecks(accounts);
 	}
 
@@ -1312,6 +1342,13 @@ const codexQuotaChecker: ProviderQuotaChecker = {
 			];
 			if (snapshot.email) {
 				details.push(`email: ${snapshot.email}`);
+			}
+			const rateLimitState = formatCodexRateLimitState(snapshot.rateLimit);
+			if (rateLimitState) {
+				details.push(`rate limit state: ${rateLimitState}`);
+			}
+			if (!snapshot.fiveHour && !snapshot.weekly && rateLimitState) {
+				details.push("quota windows: endpoint did not return 5-hour or 7-day windows; using rate limit state");
 			}
 			details.push(
 				`5-hour window: ${formatRemainingPercent(fiveHourLeft)} left, resets ${formatResetLong(snapshot.fiveHour?.resetAt)}`,
