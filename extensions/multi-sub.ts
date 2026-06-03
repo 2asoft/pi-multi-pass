@@ -1687,13 +1687,10 @@ interface DashboardState {
 	members: DashboardMemberState[];
 }
 
-async function buildDashboardState(ctx: ExtensionCommandContext, refreshQuota: boolean): Promise<DashboardState> {
+async function buildDashboardState(ctx: ExtensionCommandContext): Promise<DashboardState> {
 	const config = loadGlobalConfig();
-	let quotaByProvider = new Map<string, QuotaCheckResult>();
-	if (refreshQuota) {
-		const results = await runQuotaChecks(collectQuotaAccounts(ctx, config));
-		quotaByProvider = new Map(results.map((result) => [result.account.providerName, result]));
-	}
+	const results = await runQuotaChecks(collectQuotaAccounts(ctx, config));
+	const quotaByProvider = new Map(results.map((result) => [result.account.providerName, result]));
 	return {
 		config,
 		members: allMembers(config).map(({ set, member }) => ({
@@ -1725,7 +1722,6 @@ function formatDashboardMemberDescription(state: DashboardMemberState): string {
 function dashboardItems(state: DashboardState): SelectItem[] {
 	const items: SelectItem[] = [
 		{ value: "action:add", label: "add account", description: "Add another equivalent account" },
-		{ value: "action:refresh", label: "refresh limits", description: "Fetch quota for all supported accounts" },
 	];
 	for (const set of state.config.sets) {
 		const states = state.members.filter((candidate) => candidate.set.id === set.id);
@@ -1837,14 +1833,9 @@ async function handleDashboardMemberActions(
 	}
 }
 
-async function handleSubsDashboard(
-	pi: ExtensionAPI,
-	ctx: ExtensionCommandContext,
-	options: { refreshQuota?: boolean } = {},
-): Promise<void> {
-	let refreshQuota = options.refreshQuota ?? false;
+async function handleSubsDashboard(pi: ExtensionAPI, ctx: ExtensionCommandContext): Promise<void> {
 	while (true) {
-		const state = await buildDashboardState(ctx, refreshQuota);
+		const state = await buildDashboardState(ctx);
 		if (state.config.sets.length === 0) {
 			const action = await showWrappedSelect(ctx, {
 				title: "Subscription Dashboard",
@@ -1857,7 +1848,7 @@ async function handleSubsDashboard(
 		}
 		const selected = await showWrappedSelect(ctx, {
 			title: "Subscription Dashboard",
-			subtitle: refreshQuota ? "Quota refreshed. Select an account or set for actions." : "Select an account or set for actions. Use refresh limits to fetch quota.",
+			subtitle: "Quota refreshed. Select an account or set for actions.",
 			items: dashboardItems(state),
 			initialValue: ctx.model?.provider ? `member:${ctx.model.provider}` : undefined,
 			confirmHint: "actions",
@@ -1866,10 +1857,6 @@ async function handleSubsDashboard(
 		if (!selected) return;
 		if (selected === "action:add") {
 			await handleSubsAdd(pi, ctx);
-			continue;
-		}
-		if (selected === "action:refresh") {
-			refreshQuota = true;
 			continue;
 		}
 		if (selected.startsWith("set:")) {
@@ -1969,37 +1956,23 @@ async function handleSubsSwitch(pi: ExtensionAPI, ctx: ExtensionCommandContext, 
 }
 
 
-async function handleSubsMenu(pi: ExtensionAPI, ctx: ExtensionCommandContext): Promise<void> {
-	return handleSubsDashboard(pi, ctx);
-}
-
 async function dispatchSubsCommand(pi: ExtensionAPI, ctx: ExtensionCommandContext, command: string, rest: string): Promise<void> {
 	switch (command) {
-		case "list":
-		case "ls":
-		case "status":
-		case "info":
-		case "auto":
+		case "":
 			return handleSubsDashboard(pi, ctx);
 		case "add":
-		case "new":
 			return handleSubsAdd(pi, ctx, rest || undefined);
 		case "login":
 			return handleSubsLogin(ctx);
 		case "logout":
 			return handleSubsLogout(ctx);
 		case "remove":
-		case "rm":
-		case "delete":
 			return handleSubsRemove(pi, ctx);
 		case "switch":
 			return handleSubsSwitch(pi, ctx, rest || undefined);
-		case "limits":
-		case "quota":
-		case "usage":
-			return handleSubsDashboard(pi, ctx, { refreshQuota: true });
 		default:
-			return handleSubsMenu(pi, ctx);
+			ctx.ui.notify(`Unknown /subs command: ${command}`, "warning");
+			return;
 	}
 }
 
@@ -2037,7 +2010,7 @@ export default function multiSub(pi: ExtensionAPI) {
 	pi.registerCommand("subs", {
 		description: "Manage equivalent OAuth subscriptions",
 		getArgumentCompletions: (prefix: string) => {
-			const subcommands = ["list", "add", "remove", "login", "logout", "switch", "status", "limits", "auto"];
+			const subcommands = ["add", "remove", "login", "logout", "switch"];
 			const filtered = subcommands.filter((subcommand) => subcommand.startsWith(prefix));
 			return filtered.length > 0 ? filtered.map((subcommand) => ({ value: subcommand, label: subcommand })) : null;
 		},

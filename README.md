@@ -24,10 +24,9 @@ Each account can be enabled or disabled for automatic switching. Disabled accoun
 ## Quick start
 
 ```text
-/subs           Open the subscription dashboard
+/subs           Open the subscription dashboard, including refreshed quota
 /subs add       Add an equivalent account for a provider
 /login          Authenticate the new account
-/subs limits    Open the dashboard with quota refreshed
 /subs switch    Manually switch account
 ```
 
@@ -38,14 +37,13 @@ When the active account returns a rate-limit-style runtime error, multi-pass can
 ```text
 /subs              Open the subscription dashboard
 /subs add          Add an equivalent account
-/subs limits       Open the dashboard with quota refreshed
 /subs switch       Quick manual switch
 /subs login        Shortcut to login instructions
 /subs logout       Shortcut to log out an account
 /subs remove       Shortcut to remove an account
 ```
 
-The dashboard combines list, status, limits, and auto-switch settings. Select a set to change its auto-switch policy or strategy. Select an account to switch, toggle auto/manual, view quota details, login/logout, or remove it.
+The dashboard always refreshes quota and combines status, limits, and auto-switch settings. Select a set to change its auto-switch policy or strategy. Select an account to switch, toggle auto/manual, view quota details, login/logout, or remove it.
 
 ## Auto-switch strategies
 
@@ -105,7 +103,7 @@ No project config is used.
 
 ## Built-in limits support
 
-`/subs limits` uses provider-specific quota checkers.
+The `/subs` dashboard uses provider-specific quota checkers.
 
 Currently implemented:
 
@@ -113,7 +111,7 @@ Currently implemented:
 - `google-gemini-cli`: queries Google Cloud Code Assist quota.
 - `google-antigravity`: queries Antigravity available-model quota.
 
-`/subs limits` opens the subscription dashboard after refreshing quota. Automatic switching still happens only after a runtime rate-limit-style error.
+Automatic switching still happens only after a runtime rate-limit-style error.
 
 ## License
 
