@@ -1,349 +1,98 @@
 # pi-multi-pass
 
-Multi-subscription extension for [pi](https://github.com/earendil-works/pi-coding-agent) -- use multiple OAuth accounts per provider with automatic rate-limit rotation and project-level affinity.
+Multi-subscription extension for [pi](https://github.com/earendil-works/pi-coding-agent). Add equivalent OAuth accounts for the same provider and let pi switch between them automatically when the current account hits a rate limit.
 
 ## Install
 
 ```bash
-pi install npm:pi-multi-pass
+pi install git:github.com/2asoft/pi-multi-pass
 ```
 
-Or via git:
+## Core idea
 
-```bash
-pi install git:github.com/hjanuschka/pi-multi-pass
+A subscription set contains equivalent accounts for one provider, for example ChatGPT Codex:
+
+```text
+codex
+  openai-codex      native account
+  openai-codex-2    work account
+  openai-codex-3    personal account
 ```
 
-## Features
-
-- **Multiple subscriptions**: Add extra OAuth accounts for any provider
-- **Rotation pools**: Group subscriptions and auto-rotate on rate limits
-- **Smart pool strategies**: `round-robin`, `quota-first`, `scheduled` (time windows), `custom` (JS script hook)
-- **Fallback chains**: Define ordered cross-pool/model failover via `/pool chain`
-- **Model presets**: Named routing shortcuts across providers (`/mp-preset coding-premium`)
-- **Built-in limits checks**: Inspect subscription headroom across accounts with `/subs limits`
-- **Smarter retries**: Preserve failover progress across internal replay retries
-- **Project affinity**: Restrict which subs/pools/chains are used per project
-- **TUI management**: `/subs`, `/pool`, and `/mp-preset` commands -- no config files needed
-- **Labels**: Tag subscriptions (e.g. "work", "personal")
+Each account can be enabled or disabled for automatic switching. Disabled accounts remain available for manual switching.
 
 ## Quick start
 
-```
-/subs add              Pick a provider, add a subscription
-/login                 Authenticate the new subscription
-/subs switch           Manually switch to another subscription/provider
-/subs limits           Check built-in quota support (Codex + Google)
-/pool create           Group subs into a rotation pool (with strategy selection)
-/pool chain create     Build an ordered fallback chain across pools
-/mp-preset create         Create a named routing preset across providers
-/mp-preset coding-premium Activate a preset by name
+```text
+/subs add       Add an equivalent account for a provider
+/login          Authenticate the new account
+/subs auto      Choose which accounts may be used automatically
+/subs limits    Inspect account headroom
+/subs switch    Manually switch account
 ```
 
-When one account hits a rate limit during an assistant turn, multi-pass automatically switches to the next eligible target and retries.
+When the active account returns a rate-limit-style runtime error, multi-pass can switch to another enabled equivalent account and retry the same prompt with the same model ID.
 
 ## Commands
 
-### `/subs` -- Subscription management
-
-```
+```text
 /subs              Open menu
-/subs add          Add a new subscription
-/subs remove       Remove a subscription
-/subs login        Login to a subscription
-/subs logout       Logout from a subscription
-/subs switch       Manually switch to a subscription/provider now
-/subs list         List subscriptions with auth status; select one for quick actions
-/subs status       Detailed status (token expiry, pool membership)
-/subs limits       Check built-in quota/usage support (Codex + Google)
+/subs add          Add an equivalent account
+/subs login        Show login instructions for an account
+/subs logout       Log out an account
+/subs list         List equivalent subscription sets
+/subs status       Show detailed auth and auto-switch status
+/subs limits       Check built-in quota/usage support
+/subs switch       Manually switch to another equivalent account
+/subs auto         Configure automatic switching
+/subs remove       Remove an equivalent account
 ```
 
-### `/pool` -- Rotation pool and chain management
-
-```
-/pool              Open menu
-/pool create       Create a pool (pick provider, select members)
-/pool list         Show pools; select one for quick actions
-/pool chain        Open chain manager
-/pool toggle       Enable/disable a pool
-/pool remove       Delete a pool (keeps subscriptions; prunes linked chain entries)
-/pool status       Member health (logged in, rate limited, cooling down)
-/pool project      Project-level config (restrict subs, override pools/chains)
-```
-
-### `/pool chain` -- Ordered fallback chain management
-
-```
-/pool chain             Open chain manager
-/pool chain create      Create a chain
-/pool chain list        Show all chains
-/pool chain toggle      Enable/disable a chain
-/pool chain remove      Delete a chain
-/pool chain status      Inspect chain entries and validity
-```
-
-### `/mp-preset` -- Model presets (named routing)
-
-```
-/mp-preset                 Open menu
-/mp-preset activate        Switch to a preset's best available entry
-/mp-preset <name>          Activate a preset by name directly
-/mp-preset create          Create a new preset
-/mp-preset list            Show all presets
-/mp-preset toggle          Enable/disable a preset
-/mp-preset remove          Delete a preset
-```
-
-## Project-level configuration
-
-Use `/pool project` to configure per-project subscription affinity. This creates `.pi/multi-pass.json` in your project directory.
-
-When `allowedSubs` is set, multi-pass now treats it as an exact allow-list for this project: active routing, pool membership, and chain traversal are all constrained to those provider names.
-
-### Use case: separate work and personal accounts
-
-```
-# Global: you have 3 Codex accounts
-/subs add   -> openai-codex-2 (label: work)
-/subs add   -> openai-codex-3 (label: personal)
-
-# Corp project: restrict to team accounts only
-cd ~/work/corp-project
-/pool project -> restrict -> select openai-codex-2 only
-
-# Side project: allow everything (no restriction)
-cd ~/side-project
-# No .pi/multi-pass.json needed -- uses all global subs
-```
-
-### What project config can do
-
-| Feature | Description |
-|---|---|
-| **Restrict subs** | Only allow specific provider names in this project (for example `openai-codex-2` or `openai-codex`) |
-| **Override pools** | Use different pools than global (or disable some) |
-| **Override chains** | Use different fallback chains than global |
-| **Clear** | Remove project config, fall back to global |
-| **Info** | Show effective config (which pools/chains/subs are active) |
-
-### Project config file
-
-`.pi/multi-pass.json`:
-
-```json
-{
-  "allowedSubs": ["openai-codex-2", "anthropic-2"],
-  "pools": [
-    {
-      "name": "work-codex",
-      "baseProvider": "openai-codex",
-      "members": ["openai-codex-2"],
-      "enabled": true
-    }
-  ],
-  "chains": [
-    {
-      "name": "work-fallback",
-      "enabled": true,
-      "entries": [
-        { "pool": "work-codex", "model": "gpt-5-mini", "enabled": true }
-      ]
-    }
-  ]
-}
-```
-
-- `allowedSubs`: whitelist of exact provider names. If set, only those exact providers are available in this project. Omit to allow all.
-- `pools`: if set, replaces global pools for this project. Omit to inherit global pools.
-- `chains`: if set, replaces global chains for this project. Omit to inherit global chains.
-
-## How pools work
-
-1. You're using `openai-codex` and hit a rate limit
-2. Multi-pass detects the error, marks `openai-codex` as exhausted
-3. Switches to `openai-codex-2` (same model ID, different account)
-4. Retries your last prompt automatically
-5. After a 5-minute cooldown, `openai-codex` becomes available again
-
-### Pool selection strategy
-
-Each pool has a `strategy` that controls how the next member is chosen on failover:
+## Auto-switch strategies
 
 | Strategy | Behavior |
 |---|---|
-| `round-robin` | Rotate sequentially through members (default) |
-| `quota-first` | Query built-in quota checkers and prefer the member with the most remaining quota |
-| `scheduled` | Use per-member time windows and priority roles |
-| `custom` | Delegate to a user-provided JS selector script |
+| `quota-first` | Query built-in quota checkers and pick the account with the most headroom. Falls back to round-robin when quota data is unavailable. |
+| `round-robin` | Rotate through enabled authenticated accounts. |
+| `manual` | Do not pick automatic targets. Manual `/subs switch` still works. |
 
-Set the strategy during pool creation (`/pool create`) or change it later via `/pool list` -> select pool -> `strategy`.
+## Config
 
-All strategies fall back to round-robin when their specific data is unavailable.
-
-#### `quota-first`
-
-You have 3 Codex accounts in a pool. Account A has 80% of its 5-hour window left, account B has 20%, account C has 60%. On failover, `quota-first` picks account A first instead of just the next one in rotation order.
-
-Uses the same built-in quota checkers as `/subs limits` (currently Codex and Google providers).
+Config is global and stored at `~/.pi/agent/multi-pass.json`.
 
 ```json
 {
-  "name": "codex-pool",
-  "baseProvider": "openai-codex",
-  "members": ["openai-codex", "openai-codex-2", "openai-codex-3"],
-  "enabled": true,
-  "strategy": "quota-first"
-}
-```
-
-#### `scheduled`
-
-Assign each member a role and optional time windows:
-
-- **preferred**: only used during its active windows. When multiple preferred members are active, the one whose window ends soonest goes first (burn that quota before the window closes).
-- **default** (no role): always available, used after preferred members.
-- **overflow**: last resort, used when preferred and default members are exhausted.
-
-```json
-{
-  "name": "codex-pool",
-  "baseProvider": "openai-codex",
-  "members": ["openai-codex", "openai-codex-2", "openai-codex-3"],
-  "enabled": true,
-  "strategy": "scheduled",
-  "memberSchedule": {
-    "openai-codex": {
-      "role": "preferred",
-      "windows": [{ "hours": [9, 17], "days": ["mon", "tue", "wed", "thu", "fri"] }]
-    },
-    "openai-codex-2": {
-      "role": "preferred",
-      "windows": [{ "hours": [17, 9] }]
-    },
-    "openai-codex-3": {
-      "role": "overflow"
-    }
-  }
-}
-```
-
-Window format:
-- `hours`: `[start, end)` in 24h local time. Wraps midnight when start > end (e.g. `[22, 6]` = 22:00-05:59).
-- `days`: array of `"mon"`, `"tue"`, ..., `"sun"`. Omit for every day.
-- `dateRange`: `{ "from": "2025-06-01", "to": "2025-06-30" }` for temporary windows.
-
-During pool creation or via the `strategy` quick action, you can configure schedules interactively with human-friendly input like `9-17 mon-fri`.
-
-#### `custom`
-
-Point to a JS script that decides which member to try first. The script receives full context and returns the preferred provider name (or an ordered array).
-
-```json
-{
-  "name": "codex-pool",
-  "baseProvider": "openai-codex",
-  "members": ["openai-codex", "openai-codex-2", "openai-codex-3"],
-  "enabled": true,
-  "strategy": "custom",
-  "selectorScript": "selectors/my-codex-selector.js"
-}
-```
-
-Script paths are resolved relative to `~/.pi/agent/`. Absolute paths and `~/` paths also work.
-
-**Selector script interface:**
-
-```js
-// ~/.pi/agent/selectors/my-codex-selector.js
-module.exports = async function select(ctx) {
-  // ctx.members:         string[]  -- available (non-exhausted, authenticated) members
-  // ctx.currentProvider: string    -- the provider that just hit a rate limit
-  // ctx.modelId:         string    -- the model ID being used
-  // ctx.pool:            object    -- { name, baseProvider, members }
-  // ctx.timestamp:       number    -- current Unix timestamp (ms)
-  // ctx.hour:            number    -- current hour (0-23, local time)
-  // ctx.day:             string    -- current day of week ("mon".."sun")
-  // ctx.prompt:          string?   -- last user prompt, if available
-  //
-  // Return: string (provider name), string[] (ordered preference), or undefined (fall back)
-
-  // Example: prefer a specific account during business hours
-  if (ctx.hour >= 9 && ctx.hour < 17) {
-    return ctx.members.find(m => m === "openai-codex-2");
-  }
-  return ctx.members[0];
-};
-```
-
-If the script throws, returns an invalid provider name, or the file is missing, the pool falls back to round-robin.
-
-## How chains work
-
-1. You define an ordered chain of pool/model entries (for example `primary -> backup -> solo`)
-2. If the current pool has no eligible members, multi-pass continues forward in the chain
-3. It skips disabled or invalid entries and reports why in warnings
-4. During retry replays for the same prompt, it preserves cascade state and avoids re-trying already attempted providers
-5. Session status shows the active chain start entry: `chain:<name> | starts <pool> -> <model>`
-
-## Model presets
-
-Presets are named routing shortcuts that map to an ordered list of provider+model entries across different providers. Think of them as intent-based routing: `coding-premium`, `coding-budget`, `fastest`, etc.
-
-### Commands
-
-```
-/mp-preset              Open menu
-/mp-preset activate     Switch to a preset's best available entry
-/mp-preset <name>       Activate a preset by name directly
-/mp-preset create       Create a new preset
-/mp-preset list         Show all presets
-/mp-preset toggle       Enable/disable a preset
-/mp-preset remove       Delete a preset
-```
-
-### Example
-
-```
-/mp-preset create
-  Name: coding-premium
-  Entries:
-    1. anthropic / claude-sonnet-4-20250514
-    2. openai-codex / o3
-    3. google-gemini-cli / gemini-2.5-pro
-
-/mp-preset coding-premium
-  -> Tries anthropic first. If not logged in, tries openai-codex. Then gemini.
-```
-
-### Config
-
-Presets are stored in `~/.pi/agent/multi-pass.json`:
-
-```json
-{
-  "presets": [
+  "sets": [
     {
-      "name": "coding-premium",
-      "enabled": true,
-      "entries": [
-        { "provider": "anthropic", "model": "claude-sonnet-4-20250514", "enabled": true },
-        { "provider": "openai-codex", "model": "o3", "enabled": true },
-        { "provider": "google-gemini-cli", "model": "gemini-2.5-pro", "enabled": true }
-      ]
-    },
-    {
-      "name": "coding-budget",
-      "enabled": true,
-      "entries": [
-        { "provider": "openai-codex", "model": "gpt-4.1-mini", "enabled": true },
-        { "provider": "google-gemini-cli", "model": "gemini-2.5-flash", "enabled": true }
-      ]
+      "id": "codex",
+      "baseProvider": "openai-codex",
+      "members": [
+        { "providerName": "openai-codex", "enabled": true },
+        { "providerName": "openai-codex-2", "label": "work", "enabled": true },
+        { "providerName": "openai-codex-3", "label": "personal", "enabled": false }
+      ],
+      "autoSwitch": {
+        "enabled": true,
+        "strategy": "quota-first",
+        "cooldownMs": 300000
+      }
     }
   ]
 }
 ```
 
-Presets work with pools: if an entry's provider belongs to a pool, rate-limit failover still rotates within that pool before trying the next preset entry.
+Fields:
+
+- `id`: display name for the equivalent set.
+- `baseProvider`: provider being cloned, such as `openai-codex`.
+- `members[].providerName`: concrete provider name. Native account is the base provider; extra accounts use `baseProvider-N`.
+- `members[].enabled`: whether this account may be selected automatically.
+- `members[].label`: optional display label.
+- `autoSwitch.enabled`: whether runtime failover is active for the set.
+- `autoSwitch.strategy`: `quota-first`, `round-robin`, or `manual`.
+- `autoSwitch.cooldownMs`: how long to avoid an account after it rate-limits.
+
+No project config is used.
 
 ## Supported providers
 
@@ -357,38 +106,15 @@ Presets work with pools: if an entry's provider belongs to a pool, rate-limit fa
 
 ## Built-in limits support
 
-`/subs limits` uses a provider-specific checker registry.
+`/subs limits` uses provider-specific quota checkers.
 
 Currently implemented:
 
-- `openai-codex`: fetches ChatGPT/Codex usage from `https://chatgpt.com/backend-api/wham/usage` (or `CHATGPT_BASE_URL`), then summarizes the 5-hour and 7-day subscription windows for the base account and any configured extra Codex subscriptions.
-- `google-gemini-cli`: refreshes the saved Google OAuth session when needed, then queries `https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota` and summarizes the returned Gemini quota buckets by their bottleneck family (for example `Pro` or `Flash`).
-- `google-antigravity`: refreshes the saved Antigravity OAuth session when needed, then queries `v1internal:fetchAvailableModels` on the Google Cloud Code Assist endpoints with Antigravity-style headers and summarizes the returned model-level bottleneck.
+- `openai-codex`: fetches ChatGPT/Codex usage from `https://chatgpt.com/backend-api/wham/usage` or `CHATGPT_BASE_URL`.
+- `google-gemini-cli`: queries Google Cloud Code Assist quota.
+- `google-antigravity`: queries Antigravity available-model quota.
 
-Google quota is not a single flat subscription bucket, so the details view shows one line per returned Gemini family or Antigravity model with its remaining headroom and reset time.
-
-`/subs limits` is an on-demand snapshot. It helps you see which account looks healthiest right now. Automatic switching still happens when the active provider returns a rate-limit-style runtime error and that provider belongs to an enabled pool or chain.
-
-When a pool uses the `quota-first` strategy, the same quota checkers are used automatically during failover to pick the healthiest member instead of just round-robin.
-
-When a project defines `.pi/multi-pass.json` with `allowedSubs`, `/subs limits` only shows accounts allowed in that project.
-
-Future providers can add another checker without changing the `/subs` command surface.
-
-## Environment variable (optional)
-
-```bash
-export MULTI_SUB="openai-codex:2,anthropic:1"
-```
-
-Env entries merge with saved config.
-
-## Config files
-
-| File | Scope | Contains |
-|---|---|---|
-| `~/.pi/agent/multi-pass.json` | Global | Subscriptions + pools + chains |
-| `.pi/multi-pass.json` | Project | Pool/chain overrides + sub restrictions |
+`/subs limits` is an on-demand snapshot. Automatic switching still happens only after a runtime rate-limit-style error.
 
 ## License
 
