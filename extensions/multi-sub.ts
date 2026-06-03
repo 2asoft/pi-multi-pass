@@ -304,6 +304,7 @@ interface CodexRateLimitState {
 interface CodexUsageSnapshot {
 	planType: string;
 	email: string;
+	primary?: CodexUsageWindow;
 	fiveHour?: CodexUsageWindow;
 	weekly?: CodexUsageWindow;
 	rateLimit?: CodexRateLimitState;
@@ -413,6 +414,7 @@ function parseCodexUsageSnapshot(data: unknown): CodexUsageSnapshot {
 	return {
 		planType: typeof raw?.plan_type === "string" ? raw.plan_type : "unknown",
 		email: typeof raw?.email === "string" ? raw.email : "",
+		primary: windows[0],
 		fiveHour,
 		weekly,
 		rateLimit: parseCodexRateLimitState(rateLimit),
@@ -453,6 +455,12 @@ function formatResetLong(resetAt?: number): string {
 function formatRemainingPercent(value: number | undefined): string {
 	if (value === undefined) return "--";
 	return `${Math.round(value)}%`;
+}
+
+function formatCodexWindowSummary(label: string, window: CodexUsageWindow | undefined): string | undefined {
+	const remaining = getCodexWindowRemaining(window);
+	if (remaining === undefined) return undefined;
+	return `${label} ${formatRemainingPercent(remaining)} (${formatResetShort(window?.resetAt)})`;
 }
 
 function formatCodexRateLimitState(state: CodexRateLimitState | undefined): string | undefined {
@@ -502,10 +510,14 @@ function classifyCodexQuotaKind(snapshot: CodexUsageSnapshot): {
 	const fiveHourLeft = getCodexWindowRemaining(snapshot.fiveHour);
 	const weeklyLeft = getCodexWindowRemaining(snapshot.weekly);
 	const values = [fiveHourLeft, weeklyLeft].filter((value): value is number => value !== undefined);
+	if (snapshot.rateLimit?.limitReached === true || snapshot.rateLimit?.allowed === false) {
+		return { kind: "blocked", score: 0 };
+	}
 	if (values.length === 0) {
-		if (snapshot.rateLimit?.limitReached === true || snapshot.rateLimit?.allowed === false) {
-			return { kind: "blocked", score: 0 };
-		}
+		const primaryLeft = getCodexWindowRemaining(snapshot.primary);
+		if (primaryLeft !== undefined) values.push(primaryLeft);
+	}
+	if (values.length === 0) {
 		if (snapshot.rateLimit?.allowed === true || snapshot.rateLimit?.limitReached === false) {
 			return { kind: "ready", score: 100 };
 		}
@@ -1275,10 +1287,17 @@ const codexQuotaChecker: ProviderQuotaChecker = {
 			const fiveHourLeft = getCodexWindowRemaining(snapshot.fiveHour);
 			const weeklyLeft = getCodexWindowRemaining(snapshot.weekly);
 			const classification = classifyCodexQuotaKind(snapshot);
+			const windowSummaries = [
+				formatCodexWindowSummary("5h", snapshot.fiveHour),
+				formatCodexWindowSummary("7d", snapshot.weekly),
+			].filter((part): part is string => Boolean(part));
+			if (windowSummaries.length === 0) {
+				const primarySummary = formatCodexWindowSummary("primary", snapshot.primary);
+				if (primarySummary) windowSummaries.push(primarySummary);
+			}
 			const summary = [
 				snapshot.planType !== "unknown" ? snapshot.planType : "plan unknown",
-				`5h ${formatRemainingPercent(fiveHourLeft)} (${formatResetShort(snapshot.fiveHour?.resetAt)})`,
-				`7d ${formatRemainingPercent(weeklyLeft)} (${formatResetShort(snapshot.weekly?.resetAt)})`,
+				...(windowSummaries.length > 0 ? windowSummaries : ["quota windows unavailable"]),
 				formatQuotaKind(classification.kind),
 			].join(" | ");
 			const details = [
@@ -1294,14 +1313,22 @@ const codexQuotaChecker: ProviderQuotaChecker = {
 			if (rateLimitState) {
 				details.push(`rate limit state: ${rateLimitState}`);
 			}
-			if (!snapshot.fiveHour && !snapshot.weekly && rateLimitState) {
-				details.push("quota windows: endpoint did not return 5-hour or 7-day windows; using rate limit state");
+			if (!snapshot.fiveHour && !snapshot.weekly) {
+				if (snapshot.primary) {
+					details.push("quota windows: endpoint did not return named 5-hour or 7-day windows; showing primary window");
+				} else if (rateLimitState) {
+					details.push("quota windows: endpoint did not return quota windows; using rate limit state");
+				}
 			}
-			details.push(
-				`5-hour window: ${formatRemainingPercent(fiveHourLeft)} left, resets ${formatResetLong(snapshot.fiveHour?.resetAt)}`,
-				`7-day window: ${formatRemainingPercent(weeklyLeft)} left, resets ${formatResetLong(snapshot.weekly?.resetAt)}`,
-				`endpoint: ${baseUrl}/wham/usage`,
-			);
+			if (snapshot.primary && !snapshot.fiveHour && !snapshot.weekly) {
+				details.push(`primary window: ${formatRemainingPercent(getCodexWindowRemaining(snapshot.primary))} left, resets ${formatResetLong(snapshot.primary.resetAt)}`);
+			} else {
+				details.push(
+					`5-hour window: ${formatRemainingPercent(fiveHourLeft)} left, resets ${formatResetLong(snapshot.fiveHour?.resetAt)}`,
+					`7-day window: ${formatRemainingPercent(weeklyLeft)} left, resets ${formatResetLong(snapshot.weekly?.resetAt)}`,
+				);
+			}
+			details.push(`endpoint: ${baseUrl}/wham/usage`);
 			return {
 				account,
 				kind: classification.kind,

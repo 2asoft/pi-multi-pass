@@ -31,6 +31,7 @@ function parseCodexUsageSnapshot(data) {
   return {
     planType: typeof data?.plan_type === "string" ? data.plan_type : "unknown",
     email: typeof data?.email === "string" ? data.email : "",
+    primary: windows[0],
     fiveHour: windows.find((window) => matchesUsageWindow(window, 5 * 60 * 60)),
     weekly: windows.find((window) => matchesUsageWindow(window, 7 * 24 * 60 * 60)),
     rateLimit: parseCodexRateLimitState(rateLimit),
@@ -45,10 +46,14 @@ function getCodexWindowRemaining(window) {
 function classifyCodexQuotaKind(snapshot) {
   const values = [getCodexWindowRemaining(snapshot.fiveHour), getCodexWindowRemaining(snapshot.weekly)]
     .filter((value) => value !== undefined);
+  if (snapshot.rateLimit?.limitReached === true || snapshot.rateLimit?.allowed === false) {
+    return { kind: "blocked", score: 0 };
+  }
   if (values.length === 0) {
-    if (snapshot.rateLimit?.limitReached === true || snapshot.rateLimit?.allowed === false) {
-      return { kind: "blocked", score: 0 };
-    }
+    const primaryLeft = getCodexWindowRemaining(snapshot.primary);
+    if (primaryLeft !== undefined) values.push(primaryLeft);
+  }
+  if (values.length === 0) {
     if (snapshot.rateLimit?.allowed === true || snapshot.rateLimit?.limitReached === false) {
       return { kind: "ready", score: 100 };
     }
@@ -233,6 +238,7 @@ function runCurrentWhamUsageSchemaChecks() {
 
   assert.equal(snapshot.planType, "team");
   assert.equal(snapshot.email, "test@example.com");
+  assert.equal(snapshot.primary.windowSeconds, 0);
   assert.equal(snapshot.fiveHour, undefined);
   assert.equal(snapshot.weekly, undefined);
   assert.deepEqual(snapshot.rateLimit, { allowed: true, limitReached: false });
