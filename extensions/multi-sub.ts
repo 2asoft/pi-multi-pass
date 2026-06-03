@@ -31,7 +31,6 @@ import type {
 	AgentEndEvent,
 } from "@earendil-works/pi-coding-agent";
 import {
-	BorderedLoader,
 	DynamicBorder,
 	getAgentDir,
 	keyHint,
@@ -569,110 +568,6 @@ function compareQuotaResults(left: QuotaCheckResult, right: QuotaCheckResult): n
 		|| left.account.displayName.localeCompare(right.account.displayName);
 }
 
-function getQuotaStatusGlyph(kind: QuotaStatusKind): string {
-	switch (kind) {
-		case "ready":
-			return "✓";
-		case "watch":
-			return "◔";
-		case "low":
-			return "!";
-		case "blocked":
-			return "✕";
-		case "missing-auth":
-			return "○";
-		default:
-			return "?";
-	}
-}
-
-function formatQuotaOverview(results: QuotaCheckResult[]): string {
-	const counts = {
-		ready: 0,
-		watch: 0,
-		low: 0,
-		blocked: 0,
-		error: 0,
-		missingAuth: 0,
-	};
-
-	for (const result of results) {
-		switch (result.kind) {
-			case "ready":
-				counts.ready++;
-				break;
-			case "watch":
-				counts.watch++;
-				break;
-			case "low":
-				counts.low++;
-				break;
-			case "blocked":
-				counts.blocked++;
-				break;
-			case "missing-auth":
-				counts.missingAuth++;
-				break;
-			default:
-				counts.error++;
-		}
-	}
-
-	const parts = [`${results.length} ${results.length === 1 ? "account" : "accounts"}`];
-	if (counts.ready > 0) parts.push(`${counts.ready} ready`);
-	if (counts.watch > 0) parts.push(`${counts.watch} watch`);
-	if (counts.low > 0) parts.push(`${counts.low} low`);
-	if (counts.blocked > 0) parts.push(`${counts.blocked} blocked`);
-	if (counts.error > 0) parts.push(`${counts.error} error`);
-	if (counts.missingAuth > 0) parts.push(`${counts.missingAuth} not logged in`);
-
-	const best = results[0];
-	if (best) {
-		parts.push(`best now: ${best.account.displayName}`);
-	}
-
-	return parts.join(" • ");
-}
-
-function formatQuotaCurrentHint(
-	results: QuotaCheckResult[],
-	currentProviderName: string | undefined,
-): string | undefined {
-	if (!currentProviderName) return undefined;
-
-	const current = results.find((result) => result.account.providerName === currentProviderName);
-	if (!current) return undefined;
-
-	let hint = `Current: ${current.account.displayName} is ${formatQuotaKind(current.kind)}`;
-	const best = results[0];
-	if (best && best.account.providerName !== current.account.providerName) {
-		hint += ` • best available: ${best.account.displayName}`;
-	}
-	if (current.kind !== "ready") {
-		hint += " • snapshot only: auto-switch happens after a runtime rate-limit error";
-	}
-	return hint;
-}
-
-function buildQuotaSelectItems(
-	results: QuotaCheckResult[],
-	currentProviderName: string | undefined,
-): SelectItem[] {
-	const bestProviderName = results[0]?.account.providerName;
-	return results.map((result) => {
-		const badges: string[] = [];
-		if (result.account.providerName === currentProviderName) badges.push("current");
-		if (result.account.providerName === bestProviderName) badges.push("best now");
-		const badgeSuffix = badges.length > 0 ? ` • ${badges.join(" • ")}` : "";
-
-		return {
-			value: result.account.providerName,
-			label: `${getQuotaStatusGlyph(result.kind)} ${result.account.displayName}`,
-			description: `${result.summary}${badgeSuffix}`,
-		};
-	});
-}
-
 function getWrappedSelectIndex(items: SelectItem[], value: string | undefined): number {
 	if (!value) return 0;
 	const index = items.findIndex((item) => item.value === value);
@@ -785,59 +680,6 @@ async function runQuotaChecks(
 	return results
 		.filter((result): result is QuotaCheckResult => Boolean(result))
 		.sort(compareQuotaResults);
-}
-
-async function loadQuotaResults(
-	ctx: ExtensionCommandContext,
-	accounts: QuotaAccount[],
-): Promise<QuotaCheckResult[] | null> {
-	if (!ctx.hasUI || ctx.mode !== "tui") {
-		return runQuotaChecks(accounts);
-	}
-
-	return ctx.ui.custom<QuotaCheckResult[] | null>((tui, theme, _kb, done) => {
-		const loader = new BorderedLoader(
-			tui,
-			theme,
-			`Checking limits across ${accounts.length} ${accounts.length === 1 ? "account" : "accounts"}...`,
-		);
-		loader.onAbort = () => done(null);
-
-		runQuotaChecks(accounts, loader.signal)
-			.then(done)
-			.catch((error) => {
-				if (loader.signal.aborted) {
-					done(null);
-					return;
-				}
-				console.error("Failed to load quota checks", error);
-				done(null);
-			});
-
-		return loader;
-	});
-}
-
-async function selectQuotaResult(
-	ctx: ExtensionCommandContext,
-	results: QuotaCheckResult[],
-	preferredProviderName?: string,
-): Promise<QuotaCheckResult | undefined> {
-	const currentProviderName = preferredProviderName || ctx.model?.provider;
-	const selectedProviderName = await showWrappedSelect(ctx, {
-		title: "Subscription Limits",
-		subtitle: [
-			"Select an account to inspect its full quota windows.",
-			formatQuotaOverview(results),
-			formatQuotaCurrentHint(results, currentProviderName),
-		].filter(Boolean).join("\n"),
-		items: buildQuotaSelectItems(results, currentProviderName),
-		initialValue: currentProviderName,
-		confirmHint: "inspect",
-		cancelHint: "close",
-	});
-	if (!selectedProviderName) return undefined;
-	return results.find((result) => result.account.providerName === selectedProviderName);
 }
 
 function normalizeGoogleRemainingPercent(value: unknown): number | undefined {
@@ -1659,30 +1501,6 @@ function collectQuotaAccounts(ctx: ExtensionContext | ExtensionCommandContext, c
 	return accounts;
 }
 
-async function handleSubsLimits(ctx: ExtensionCommandContext): Promise<void> {
-	const accounts = collectQuotaAccounts(ctx);
-	if (accounts.length === 0) {
-		ctx.ui.notify("No equivalent accounts with supported quota checks. Add accounts with /subs add first.", "info");
-		return;
-	}
-	const results = await loadQuotaResults(ctx, accounts);
-	if (!results) {
-		ctx.ui.notify("Cancelled subscription limit check.", "info");
-		return;
-	}
-	if (results.length === 0) {
-		ctx.ui.notify("No quota results returned.", "info");
-		return;
-	}
-	let preferredProviderName = ctx.model?.provider;
-	while (true) {
-		const selected = await selectQuotaResult(ctx, results, preferredProviderName);
-		if (!selected) return;
-		preferredProviderName = selected.account.providerName;
-		await showQuotaDetails(ctx, selected);
-	}
-}
-
 // ==========================================================================
 // Auto-switch engine
 // ==========================================================================
@@ -1856,25 +1674,215 @@ async function handleSubsAdd(pi: ExtensionAPI, ctx: ExtensionCommandContext, req
 	ctx.ui.notify(`Added ${providerName}. Use /login and select ${PROVIDER_TEMPLATES[baseProvider]?.buildOAuth(memberIndex(providerName, baseProvider) || 2).name}.`, "info");
 }
 
-async function handleSubsList(ctx: ExtensionCommandContext): Promise<void> {
+interface DashboardMemberState {
+	set: EquivalentSet;
+	member: EquivalentMember;
+	authed: boolean;
+	current: boolean;
+	quota?: QuotaCheckResult;
+}
+
+interface DashboardState {
+	config: MultiPassConfig;
+	members: DashboardMemberState[];
+}
+
+async function buildDashboardState(ctx: ExtensionCommandContext, refreshQuota: boolean): Promise<DashboardState> {
 	const config = loadGlobalConfig();
-	if (config.sets.length === 0) {
-		ctx.ui.notify("No equivalent subscriptions configured. Use /subs add.", "info");
-		return;
+	let quotaByProvider = new Map<string, QuotaCheckResult>();
+	if (refreshQuota) {
+		const results = await runQuotaChecks(collectQuotaAccounts(ctx, config));
+		quotaByProvider = new Map(results.map((result) => [result.account.providerName, result]));
 	}
-	const items = config.sets.flatMap((set) => [
-		{
+	return {
+		config,
+		members: allMembers(config).map(({ set, member }) => ({
+			set,
+			member,
+			authed: ctx.modelRegistry.authStorage.hasAuth(member.providerName),
+			current: ctx.model?.provider === member.providerName,
+			quota: quotaByProvider.get(member.providerName),
+		})),
+	};
+}
+
+function formatDashboardSetDescription(set: EquivalentSet, states: DashboardMemberState[]): string {
+	const authed = states.filter((state) => state.authed).length;
+	const auto = states.filter((state) => state.member.enabled).length;
+	return `auto-switch ${set.autoSwitch.enabled ? "on" : "off"} | ${set.autoSwitch.strategy} | ${auto}/${states.length} auto | ${authed}/${states.length} logged in`;
+}
+
+function formatDashboardMemberDescription(state: DashboardMemberState): string {
+	const parts = [
+		state.member.enabled ? "auto" : "manual",
+		state.authed ? "logged in" : "not logged in",
+	];
+	if (state.current) parts.push("current");
+	if (state.quota) parts.push(state.quota.summary);
+	return parts.join(" | ");
+}
+
+function dashboardItems(state: DashboardState): SelectItem[] {
+	const items: SelectItem[] = [
+		{ value: "action:add", label: "add account", description: "Add another equivalent account" },
+		{ value: "action:refresh", label: "refresh limits", description: "Fetch quota for all supported accounts" },
+	];
+	for (const set of state.config.sets) {
+		const states = state.members.filter((candidate) => candidate.set.id === set.id);
+		items.push({
 			value: `set:${set.id}`,
 			label: `${set.id} -- ${PROVIDER_TEMPLATES[set.baseProvider]?.displayName || set.baseProvider}`,
-			description: `auto-switch ${set.autoSwitch.enabled ? "on" : "off"}, ${set.autoSwitch.strategy}, ${set.members.length} accounts`,
-		},
-		...set.members.map((member) => ({
-			value: member.providerName,
-			label: `  ${member.providerName}`,
-			description: formatMemberLine(member, set, ctx.modelRegistry.authStorage),
-		})),
-	]);
-	await showWrappedSelect(ctx, { title: "Equivalent Subscriptions", items, confirmHint: "back", cancelHint: "back" });
+			description: formatDashboardSetDescription(set, states),
+		});
+		for (const memberState of states) {
+			items.push({
+				value: `member:${memberState.member.providerName}`,
+				label: `  ${memberState.member.enabled ? "[auto]" : "[manual]"} ${memberState.member.providerName}`,
+				description: formatDashboardMemberDescription(memberState),
+			});
+		}
+	}
+	return items;
+}
+
+function loginInstructionForMember(set: EquivalentSet, member: EquivalentMember): string {
+	const index = memberIndex(member.providerName, set.baseProvider);
+	return member.providerName === set.baseProvider
+		? PROVIDER_TEMPLATES[set.baseProvider]?.builtinOAuth.name || set.baseProvider
+		: PROVIDER_TEMPLATES[set.baseProvider]?.buildOAuth(index || 2).name || member.providerName;
+}
+
+async function switchToProvider(pi: ExtensionAPI, ctx: ExtensionCommandContext, providerName: string): Promise<void> {
+	const model = findProviderModel(ctx, providerName, ctx.model?.id);
+	if (!model) {
+		ctx.ui.notify(`${providerName} cannot serve current model ${ctx.model?.id || "unknown"}.`, "warning");
+		return;
+	}
+	const success = await pi.setModel(model);
+	ctx.ui.notify(success ? `Switched to ${providerName}/${model.id}.` : `Failed to switch to ${providerName}.`, success ? "info" : "warning");
+}
+
+async function handleDashboardSetActions(ctx: ExtensionCommandContext, config: MultiPassConfig, set: EquivalentSet): Promise<void> {
+	while (true) {
+		const action = await showWrappedSelect(ctx, {
+			title: `Set: ${set.id}`,
+			subtitle: formatDashboardSetDescription(set, set.members.map((member) => ({ set, member, authed: ctx.modelRegistry.authStorage.hasAuth(member.providerName), current: ctx.model?.provider === member.providerName }))),
+			items: [
+				{ value: "toggle-auto", label: "toggle auto-switch", description: `currently ${set.autoSwitch.enabled ? "on" : "off"}` },
+				{ value: "strategy-quota-first", label: "strategy: quota-first", description: "prefer account with most quota" },
+				{ value: "strategy-round-robin", label: "strategy: round-robin", description: "rotate through auto accounts" },
+				{ value: "strategy-manual", label: "strategy: manual", description: "do not auto-switch" },
+			],
+			confirmHint: "apply",
+			cancelHint: "back",
+		});
+		if (!action) return;
+		if (action === "toggle-auto") set.autoSwitch.enabled = !set.autoSwitch.enabled;
+		else if (action === "strategy-quota-first") set.autoSwitch.strategy = "quota-first";
+		else if (action === "strategy-round-robin") set.autoSwitch.strategy = "round-robin";
+		else if (action === "strategy-manual") set.autoSwitch.strategy = "manual";
+		saveGlobalConfig(config);
+	}
+}
+
+async function handleDashboardMemberActions(
+	pi: ExtensionAPI,
+	ctx: ExtensionCommandContext,
+	config: MultiPassConfig,
+	state: DashboardMemberState,
+): Promise<void> {
+	const { set, member, quota } = state;
+	const actions: SelectItem[] = [
+		{ value: "switch", label: "switch now", description: "Use this account for the current model" },
+		{ value: "toggle-auto", label: member.enabled ? "make manual only" : "enable for auto-switch", description: "Toggle whether rate-limit failover may select this account" },
+		{ value: "login", label: "login instructions", description: `Select ${loginInstructionForMember(set, member)} from /login` },
+		{ value: "logout", label: "logout", description: state.authed ? "Clear saved auth for this account" : "Not logged in" },
+	];
+	if (quota) actions.push({ value: "quota", label: "quota details", description: quota.summary });
+	if (member.providerName !== set.baseProvider) actions.push({ value: "remove", label: "remove", description: "Remove this equivalent account" });
+
+	const action = await showWrappedSelect(ctx, {
+		title: member.providerName,
+		subtitle: memberDisplayName(member, set),
+		items: actions,
+		confirmHint: "run",
+		cancelHint: "back",
+	});
+	if (!action) return;
+	if (action === "switch") return switchToProvider(pi, ctx, member.providerName);
+	if (action === "toggle-auto") {
+		member.enabled = !member.enabled;
+		saveGlobalConfig(config);
+		ctx.ui.notify(`${member.providerName} is now ${member.enabled ? "enabled for auto-switch" : "manual only"}.`, "info");
+		return;
+	}
+	if (action === "login") {
+		ctx.ui.notify(`Use /login and select "${loginInstructionForMember(set, member)}".`, "info");
+		return;
+	}
+	if (action === "logout") {
+		ctx.modelRegistry.authStorage.logout(member.providerName);
+		ctx.ui.notify(`Logged out ${member.providerName}.`, "info");
+		return;
+	}
+	if (action === "quota" && quota) return showQuotaDetails(ctx, quota);
+	if (action === "remove") {
+		const confirmed = await ctx.ui.confirm("Remove account", `Remove ${member.providerName}? Auth for this account will also be cleared.`);
+		if (!confirmed) return;
+		set.members = set.members.filter((candidate) => candidate.providerName !== member.providerName);
+		ctx.modelRegistry.authStorage.logout(member.providerName);
+		pi.unregisterProvider(member.providerName);
+		saveGlobalConfig(config);
+		ctx.ui.notify(`Removed ${member.providerName}.`, "info");
+	}
+}
+
+async function handleSubsDashboard(
+	pi: ExtensionAPI,
+	ctx: ExtensionCommandContext,
+	options: { refreshQuota?: boolean } = {},
+): Promise<void> {
+	let refreshQuota = options.refreshQuota ?? false;
+	while (true) {
+		const state = await buildDashboardState(ctx, refreshQuota);
+		if (state.config.sets.length === 0) {
+			const action = await showWrappedSelect(ctx, {
+				title: "Subscription Dashboard",
+				subtitle: "No equivalent subscriptions configured.",
+				items: [{ value: "action:add", label: "add account", description: "Add an equivalent subscription account" }],
+				confirmHint: "open",
+			});
+			if (action === "action:add") await handleSubsAdd(pi, ctx);
+			return;
+		}
+		const selected = await showWrappedSelect(ctx, {
+			title: "Subscription Dashboard",
+			subtitle: refreshQuota ? "Quota refreshed. Select an account or set for actions." : "Select an account or set for actions. Use refresh limits to fetch quota.",
+			items: dashboardItems(state),
+			initialValue: ctx.model?.provider ? `member:${ctx.model.provider}` : undefined,
+			confirmHint: "actions",
+			cancelHint: "close",
+		});
+		if (!selected) return;
+		if (selected === "action:add") {
+			await handleSubsAdd(pi, ctx);
+			continue;
+		}
+		if (selected === "action:refresh") {
+			refreshQuota = true;
+			continue;
+		}
+		if (selected.startsWith("set:")) {
+			const set = state.config.sets.find((candidate) => candidate.id === selected.slice("set:".length));
+			if (set) await handleDashboardSetActions(ctx, state.config, set);
+			continue;
+		}
+		if (selected.startsWith("member:")) {
+			const providerName = selected.slice("member:".length);
+			const memberState = state.members.find((candidate) => candidate.member.providerName === providerName);
+			if (memberState) await handleDashboardMemberActions(pi, ctx, state.config, memberState);
+		}
+	}
 }
 
 async function selectConfiguredMember(
@@ -1960,98 +1968,19 @@ async function handleSubsSwitch(pi: ExtensionAPI, ctx: ExtensionCommandContext, 
 	ctx.ui.notify(success ? `Switched to ${providerName}/${model.id}.` : `Failed to switch to ${providerName}.`, success ? "info" : "warning");
 }
 
-async function handleSubsStatus(ctx: ExtensionCommandContext): Promise<void> {
-	const config = loadGlobalConfig();
-	if (config.sets.length === 0) {
-		ctx.ui.notify("No equivalent subscriptions configured.", "info");
-		return;
-	}
-	const lines: SelectItem[] = [];
-	for (const set of config.sets) {
-		lines.push({
-			value: `set:${set.id}`,
-			label: `${set.id}`,
-			description: `${set.baseProvider} | auto-switch ${set.autoSwitch.enabled ? "on" : "off"} | ${set.autoSwitch.strategy} | cooldown ${Math.round(set.autoSwitch.cooldownMs / 1000)}s`,
-		});
-		for (const member of set.members) {
-			lines.push({ value: member.providerName, label: `  ${member.providerName}`, description: formatMemberLine(member, set, ctx.modelRegistry.authStorage) });
-		}
-	}
-	await showWrappedSelect(ctx, { title: "Subscription Status", items: lines, confirmHint: "back", cancelHint: "back" });
-}
-
-async function handleSubsAuto(ctx: ExtensionCommandContext): Promise<void> {
-	const config = loadGlobalConfig();
-	if (config.sets.length === 0) {
-		ctx.ui.notify("No equivalent subscriptions configured. Use /subs add.", "info");
-		return;
-	}
-	const setId = await showWrappedSelect(ctx, {
-		title: "Auto-switch Groups",
-		items: config.sets.map((set) => ({
-			value: set.id,
-			label: set.id,
-			description: `${set.baseProvider} | ${set.autoSwitch.enabled ? "on" : "off"} | ${set.autoSwitch.strategy}`,
-		})),
-		confirmHint: "edit",
-	});
-	const set = config.sets.find((candidate) => candidate.id === setId);
-	if (!set) return;
-	while (true) {
-		const action = await showWrappedSelect(ctx, {
-			title: `Auto-switch: ${set.id}`,
-			subtitle: "Enabled accounts may be selected automatically after a rate-limit error.",
-			items: [
-				{ value: "toggle-auto", label: "toggle auto-switch", description: `currently ${set.autoSwitch.enabled ? "on" : "off"}` },
-				{ value: "strategy-quota-first", label: "strategy: quota-first", description: "prefer account with most quota" },
-				{ value: "strategy-round-robin", label: "strategy: round-robin", description: "rotate through enabled accounts" },
-				{ value: "strategy-manual", label: "strategy: manual", description: "disable automatic target selection" },
-				...set.members.map((member) => ({
-					value: `member:${member.providerName}`,
-					label: `${member.enabled ? "[x]" : "[ ]"} ${member.providerName}`,
-					description: formatMemberLine(member, set, ctx.modelRegistry.authStorage),
-				})),
-			],
-			confirmHint: "toggle",
-			cancelHint: "save",
-		});
-		if (!action) break;
-		if (action === "toggle-auto") set.autoSwitch.enabled = !set.autoSwitch.enabled;
-		else if (action === "strategy-quota-first") set.autoSwitch.strategy = "quota-first";
-		else if (action === "strategy-round-robin") set.autoSwitch.strategy = "round-robin";
-		else if (action === "strategy-manual") set.autoSwitch.strategy = "manual";
-		else if (action.startsWith("member:")) {
-			const providerName = action.slice("member:".length);
-			const member = set.members.find((candidate) => candidate.providerName === providerName);
-			if (member) member.enabled = !member.enabled;
-		}
-		saveGlobalConfig(config);
-	}
-	ctx.ui.notify(`Saved auto-switch settings for ${set.id}.`, "info");
-}
 
 async function handleSubsMenu(pi: ExtensionAPI, ctx: ExtensionCommandContext): Promise<void> {
-	const actions: SelectItem[] = [
-		{ value: "list", label: "list", description: "Show equivalent subscriptions" },
-		{ value: "add", label: "add", description: "Add an equivalent account" },
-		{ value: "login", label: "login", description: "Show login instructions for an account" },
-		{ value: "logout", label: "logout", description: "Log out an account" },
-		{ value: "switch", label: "switch", description: "Manually switch account" },
-		{ value: "auto", label: "auto", description: "Configure automatic switching" },
-		{ value: "limits", label: "limits", description: "Check quota/limits" },
-		{ value: "status", label: "status", description: "Show detailed status" },
-		{ value: "remove", label: "remove", description: "Remove an equivalent account" },
-	];
-	const action = await showWrappedSelect(ctx, { title: "Subscription Manager", items: actions, confirmHint: "open" });
-	if (!action) return;
-	return dispatchSubsCommand(pi, ctx, action, "");
+	return handleSubsDashboard(pi, ctx);
 }
 
 async function dispatchSubsCommand(pi: ExtensionAPI, ctx: ExtensionCommandContext, command: string, rest: string): Promise<void> {
 	switch (command) {
 		case "list":
 		case "ls":
-			return handleSubsList(ctx);
+		case "status":
+		case "info":
+		case "auto":
+			return handleSubsDashboard(pi, ctx);
 		case "add":
 		case "new":
 			return handleSubsAdd(pi, ctx, rest || undefined);
@@ -2065,15 +1994,10 @@ async function dispatchSubsCommand(pi: ExtensionAPI, ctx: ExtensionCommandContex
 			return handleSubsRemove(pi, ctx);
 		case "switch":
 			return handleSubsSwitch(pi, ctx, rest || undefined);
-		case "auto":
-			return handleSubsAuto(ctx);
 		case "limits":
 		case "quota":
 		case "usage":
-			return handleSubsLimits(ctx);
-		case "status":
-		case "info":
-			return handleSubsStatus(ctx);
+			return handleSubsDashboard(pi, ctx, { refreshQuota: true });
 		default:
 			return handleSubsMenu(pi, ctx);
 	}

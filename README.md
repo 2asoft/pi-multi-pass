@@ -24,10 +24,10 @@ Each account can be enabled or disabled for automatic switching. Disabled accoun
 ## Quick start
 
 ```text
+/subs           Open the subscription dashboard
 /subs add       Add an equivalent account for a provider
 /login          Authenticate the new account
-/subs auto      Choose which accounts may be used automatically
-/subs limits    Inspect account headroom
+/subs limits    Open the dashboard with quota refreshed
 /subs switch    Manually switch account
 ```
 
@@ -36,17 +36,16 @@ When the active account returns a rate-limit-style runtime error, multi-pass can
 ## Commands
 
 ```text
-/subs              Open menu
+/subs              Open the subscription dashboard
 /subs add          Add an equivalent account
-/subs login        Show login instructions for an account
-/subs logout       Log out an account
-/subs list         List equivalent subscription sets
-/subs status       Show detailed auth and auto-switch status
-/subs limits       Check built-in quota/usage support
-/subs switch       Manually switch to another equivalent account
-/subs auto         Configure automatic switching
-/subs remove       Remove an equivalent account
+/subs limits       Open the dashboard with quota refreshed
+/subs switch       Quick manual switch
+/subs login        Shortcut to login instructions
+/subs logout       Shortcut to log out an account
+/subs remove       Shortcut to remove an account
 ```
+
+The dashboard combines list, status, limits, and auto-switch settings. Select a set to change its auto-switch policy or strategy. Select an account to switch, toggle auto/manual, view quota details, login/logout, or remove it.
 
 ## Auto-switch strategies
 
@@ -114,7 +113,7 @@ Currently implemented:
 - `google-gemini-cli`: queries Google Cloud Code Assist quota.
 - `google-antigravity`: queries Antigravity available-model quota.
 
-`/subs limits` is an on-demand snapshot. Automatic switching still happens only after a runtime rate-limit-style error.
+`/subs limits` opens the subscription dashboard after refreshing quota. Automatic switching still happens only after a runtime rate-limit-style error.
 
 ## License
 
