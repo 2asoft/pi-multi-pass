@@ -36,18 +36,11 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import {
 	anthropicOAuthProvider,
-	loginAnthropic,
-	refreshAnthropicToken,
 	openaiCodexOAuthProvider,
-	loginOpenAICodex,
-	refreshOpenAICodexToken,
 	githubCopilotOAuthProvider,
-	loginGitHubCopilot,
-	refreshGitHubCopilotToken,
 	getGitHubCopilotBaseUrl,
 	normalizeDomain,
 	type OAuthCredentials,
-	type OAuthLoginCallbacks,
 	type OAuthProviderInterface,
 } from "@earendil-works/pi-ai/oauth";
 import { getModels, type Api, type Model } from "@earendil-works/pi-ai";
@@ -69,9 +62,27 @@ type CopilotCredentials = OAuthCredentials & { enterpriseUrl?: string };
 interface ProviderTemplate {
 	displayName: string;
 	builtinOAuth: OAuthProviderInterface;
-	usesCallbackServer?: boolean;
 	buildOAuth(index: number): Omit<OAuthProviderInterface, "id">;
 	buildModifyModels?(providerName: string): OAuthProviderInterface["modifyModels"];
+}
+
+function buildEquivalentOAuth(
+	builtinOAuth: OAuthProviderInterface,
+	name: string,
+): Omit<OAuthProviderInterface, "id"> {
+	return {
+		name,
+		usesCallbackServer: builtinOAuth.usesCallbackServer,
+		login(callbacks) {
+			return builtinOAuth.login(callbacks);
+		},
+		refreshToken(credentials) {
+			return builtinOAuth.refreshToken(credentials);
+		},
+		getApiKey(credentials) {
+			return builtinOAuth.getApiKey(credentials);
+		},
+	};
 }
 
 const PROVIDER_TEMPLATES: Record<string, ProviderTemplate> = {
@@ -79,49 +90,15 @@ const PROVIDER_TEMPLATES: Record<string, ProviderTemplate> = {
 		displayName: "Anthropic (Claude Pro/Max)",
 		builtinOAuth: anthropicOAuthProvider,
 		buildOAuth(index: number) {
-			return {
-				name: `Anthropic #${index}`,
-				async login(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials> {
-					return loginAnthropic({
-						onAuth: callbacks.onAuth,
-						onPrompt: callbacks.onPrompt,
-						onProgress: callbacks.onProgress,
-						onManualCodeInput: callbacks.onManualCodeInput,
-					});
-				},
-				async refreshToken(credentials: OAuthCredentials): Promise<OAuthCredentials> {
-					return refreshAnthropicToken(credentials.refresh);
-				},
-				getApiKey(credentials: OAuthCredentials): string {
-					return credentials.access;
-				},
-			};
+			return buildEquivalentOAuth(anthropicOAuthProvider, `Anthropic #${index}`);
 		},
 	},
 
 	"openai-codex": {
 		displayName: "ChatGPT Plus/Pro (Codex)",
 		builtinOAuth: openaiCodexOAuthProvider,
-		usesCallbackServer: true,
 		buildOAuth(index: number) {
-			return {
-				name: `ChatGPT Codex #${index}`,
-				usesCallbackServer: true,
-				async login(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials> {
-					return loginOpenAICodex({
-						onAuth: callbacks.onAuth,
-						onPrompt: callbacks.onPrompt,
-						onProgress: callbacks.onProgress,
-						onManualCodeInput: callbacks.onManualCodeInput,
-					});
-				},
-				async refreshToken(credentials: OAuthCredentials): Promise<OAuthCredentials> {
-					return refreshOpenAICodexToken(credentials.refresh);
-				},
-				getApiKey(credentials: OAuthCredentials): string {
-					return credentials.access;
-				},
-			};
+			return buildEquivalentOAuth(openaiCodexOAuthProvider, `ChatGPT Codex #${index}`);
 		},
 	},
 
@@ -129,24 +106,7 @@ const PROVIDER_TEMPLATES: Record<string, ProviderTemplate> = {
 		displayName: "GitHub Copilot",
 		builtinOAuth: githubCopilotOAuthProvider,
 		buildOAuth(index: number) {
-			return {
-				name: `GitHub Copilot #${index}`,
-				async login(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials> {
-					return loginGitHubCopilot({
-						onDeviceCode: callbacks.onDeviceCode,
-						onPrompt: callbacks.onPrompt,
-						onProgress: callbacks.onProgress,
-						signal: callbacks.signal,
-					});
-				},
-				async refreshToken(credentials: OAuthCredentials): Promise<OAuthCredentials> {
-					const creds = credentials as CopilotCredentials;
-					return refreshGitHubCopilotToken(creds.refresh, creds.enterpriseUrl);
-				},
-				getApiKey(credentials: OAuthCredentials): string {
-					return credentials.access;
-				},
-			};
+			return buildEquivalentOAuth(githubCopilotOAuthProvider, `GitHub Copilot #${index}`);
 		},
 		buildModifyModels(providerName: string) {
 			return (models: Model<Api>[], credentials: OAuthCredentials): Model<Api>[] => {
@@ -171,25 +131,6 @@ const SUPPORTED_PROVIDERS = Object.keys(PROVIDER_TEMPLATES);
 // ==========================================================================
 
 const DEFAULT_CODEX_USAGE_BASE_URL = "https://chatgpt.com/backend-api";
-const GOOGLE_GEMINI_QUOTA_ENDPOINT = "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota";
-const GOOGLE_ANTIGRAVITY_QUOTA_ENDPOINTS = [
-	"https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:fetchAvailableModels",
-	"https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels",
-] as const;
-const GOOGLE_GEMINI_HEADERS = {
-	"User-Agent": "google-api-nodejs-client/9.15.1",
-	"X-Goog-Api-Client": "gl-node/22.17.0",
-};
-const GOOGLE_ANTIGRAVITY_HEADERS = {
-	"User-Agent": "antigravity/1.11.9 windows/amd64",
-	"X-Goog-Api-Client": "google-cloud-sdk vscode_cloudshelleditor/0.1",
-	"Client-Metadata": JSON.stringify({
-		ideType: "IDE_UNSPECIFIED",
-		platform: "PLATFORM_UNSPECIFIED",
-		pluginType: "GEMINI",
-	}),
-};
-const GOOGLE_ANTIGRAVITY_HIDDEN_MODELS = new Set(["tab_flash_lite_preview"]);
 const OPENAI_AUTH_CLAIM = "https://api.openai.com/auth";
 const OPENAI_PROFILE_CLAIM = "https://api.openai.com/profile";
 
@@ -243,42 +184,6 @@ interface CodexUsageSnapshot {
 	fiveHour?: CodexUsageWindow;
 	weekly?: CodexUsageWindow;
 	rateLimit?: CodexRateLimitState;
-}
-
-interface GoogleGeminiQuotaResponse {
-	buckets?: Array<{
-		modelId?: string;
-		remainingFraction?: number;
-		resetTime?: string;
-	}>;
-}
-
-interface GoogleAntigravityQuotaResponse {
-	models?: Record<
-		string,
-		{
-			displayName?: string;
-			model?: string;
-			isInternal?: boolean;
-			quotaInfo?: {
-				remainingFraction?: number;
-				resetTime?: string;
-			};
-		}
-	>;
-}
-
-interface GoogleQuotaModelSnapshot {
-	model: string;
-	remainingPercent?: number;
-	resetAt?: number;
-}
-
-interface GoogleQuotaAccountSnapshot {
-	endpoint: string;
-	projectId?: string;
-	models: GoogleQuotaModelSnapshot[];
-	worstRemainingPercent?: number;
 }
 
 function decodeJwtPayload(token: string): Record<string, unknown> {
@@ -618,382 +523,6 @@ async function runQuotaChecks(
 		.sort(compareQuotaResults);
 }
 
-function normalizeGoogleRemainingPercent(value: unknown): number | undefined {
-	if (typeof value !== "number" || !Number.isFinite(value)) return undefined;
-	return Math.max(0, Math.min(100, Math.round(value * 100)));
-}
-
-function getGoogleProjectId(account: QuotaAccount, auth: AuthStorageEntry): string | undefined {
-	if (typeof auth.projectId === "string" && auth.projectId.length > 0) {
-		return auth.projectId;
-	}
-
-	if (account.baseProvider === "google-antigravity") {
-		const projectId = process.env.GOOGLE_ANTIGRAVITY_PROJECT_ID || process.env.GOOGLE_ANTIGRAVITY_PROJECT;
-		if (projectId) return projectId;
-	}
-
-	const projectId = process.env.GOOGLE_CLOUD_PROJECT || process.env.GOOGLE_CLOUD_PROJECT_ID;
-	return projectId || undefined;
-}
-
-function updateGoogleQuotaModel(
-	modelsByName: Map<string, GoogleQuotaModelSnapshot>,
-	model: string,
-	remainingPercent: number | undefined,
-	resetAt: number | undefined,
-): void {
-	const existing = modelsByName.get(model);
-	if (!existing) {
-		modelsByName.set(model, { model, remainingPercent, resetAt });
-		return;
-	}
-
-	let next = existing;
-	if (remainingPercent !== undefined) {
-		if (existing.remainingPercent === undefined || remainingPercent < existing.remainingPercent) {
-			next = { ...next, remainingPercent };
-		}
-	}
-	if (resetAt !== undefined) {
-		if (next.resetAt === undefined || resetAt < next.resetAt) {
-			next = { ...next, resetAt };
-		}
-	}
-	if (next !== existing) {
-		modelsByName.set(model, next);
-	}
-}
-
-function buildGoogleQuotaSnapshot(
-	endpoint: string,
-	projectId: string | undefined,
-	modelsByName: Map<string, GoogleQuotaModelSnapshot>,
-): GoogleQuotaAccountSnapshot {
-	const models = [...modelsByName.values()];
-	const remainingPercents = models
-		.map((model) => model.remainingPercent)
-		.filter((value): value is number => value !== undefined);
-	const worstRemainingPercent = remainingPercents.length > 0
-		? Math.min(...remainingPercents)
-		: undefined;
-
-	return {
-		endpoint,
-		projectId,
-		models,
-		worstRemainingPercent,
-	};
-}
-
-function getGoogleGeminiModelLabel(modelId: string | undefined): string {
-	if (!modelId) return "unknown";
-	const normalized = modelId.toLowerCase();
-	if (normalized.includes("pro")) return "Pro";
-	if (normalized.includes("flash")) return "Flash";
-	return modelId;
-}
-
-function parseGoogleGeminiQuotaSnapshot(
-	data: unknown,
-	projectId: string | undefined,
-): GoogleQuotaAccountSnapshot {
-	const raw = getRecord(data) as GoogleGeminiQuotaResponse | undefined;
-	const buckets = Array.isArray(raw?.buckets) ? raw.buckets : [];
-	const modelsByName = new Map<string, GoogleQuotaModelSnapshot>();
-
-	for (const bucketValue of buckets) {
-		const bucket = getRecord(bucketValue);
-		const model = getGoogleGeminiModelLabel(
-			typeof bucket?.modelId === "string" ? bucket.modelId : undefined,
-		);
-		const remainingPercent = normalizeGoogleRemainingPercent(bucket?.remainingFraction);
-		const resetAt = typeof bucket?.resetTime === "string"
-			? parseIsoTimestampSeconds(bucket.resetTime)
-			: undefined;
-		if (remainingPercent === undefined && resetAt === undefined) continue;
-		updateGoogleQuotaModel(modelsByName, model, remainingPercent, resetAt);
-	}
-
-	return buildGoogleQuotaSnapshot(GOOGLE_GEMINI_QUOTA_ENDPOINT, projectId, modelsByName);
-}
-
-function parseGoogleAntigravityQuotaSnapshot(
-	data: unknown,
-	endpoint: string,
-	projectId: string | undefined,
-): GoogleQuotaAccountSnapshot {
-	const raw = getRecord(data) as GoogleAntigravityQuotaResponse | undefined;
-	const rawModels = getRecord(raw?.models);
-	const modelsByName = new Map<string, GoogleQuotaModelSnapshot>();
-
-	if (rawModels) {
-		for (const [modelKey, modelValue] of Object.entries(rawModels)) {
-			const model = getRecord(modelValue);
-			if (model?.isInternal === true) continue;
-			if (GOOGLE_ANTIGRAVITY_HIDDEN_MODELS.has(modelKey.toLowerCase())) continue;
-			const displayName = typeof model?.displayName === "string" && model.displayName.length > 0
-				? model.displayName
-				: typeof model?.model === "string" && model.model.length > 0
-					? model.model
-					: modelKey;
-			if (GOOGLE_ANTIGRAVITY_HIDDEN_MODELS.has(displayName.toLowerCase())) continue;
-			const quotaInfo = getRecord(model?.quotaInfo);
-			const remainingPercent = normalizeGoogleRemainingPercent(quotaInfo?.remainingFraction);
-			const resetAt = typeof quotaInfo?.resetTime === "string"
-				? parseIsoTimestampSeconds(quotaInfo.resetTime)
-				: undefined;
-			if (remainingPercent === undefined && resetAt === undefined) continue;
-			updateGoogleQuotaModel(modelsByName, displayName, remainingPercent, resetAt);
-		}
-	}
-
-	return buildGoogleQuotaSnapshot(endpoint, projectId, modelsByName);
-}
-
-function classifyGoogleQuotaKind(snapshot: GoogleQuotaAccountSnapshot): {
-	kind: QuotaStatusKind;
-	score: number;
-} {
-	const bottleneck = snapshot.worstRemainingPercent;
-	if (bottleneck === undefined) {
-		return { kind: "error", score: 0 };
-	}
-	if (bottleneck <= 5) return { kind: "blocked", score: bottleneck };
-	if (bottleneck <= 15) return { kind: "low", score: bottleneck };
-	if (bottleneck <= 30) return { kind: "watch", score: bottleneck };
-	return { kind: "ready", score: bottleneck };
-}
-
-async function resolveGoogleQuotaAccess(
-	account: QuotaAccount,
-	auth: AuthStorageEntry,
-): Promise<{ accessToken: string; projectId?: string }> {
-	const projectId = getGoogleProjectId(account, auth);
-	const hasFreshAccess = typeof auth.access === "string"
-		&& auth.access.length > 0
-		&& (typeof auth.expires !== "number" || auth.expires > Date.now() + 60_000);
-	if (hasFreshAccess && typeof auth.access === "string") {
-		return { accessToken: auth.access, projectId };
-	}
-
-	if (typeof auth.refresh === "string" && auth.refresh.length > 0) {
-		throw new Error("Google OAuth refresh is unavailable in this pi version. Log in again after pi restores this provider.");
-	}
-
-	if (typeof auth.access === "string" && auth.access.length > 0) {
-		return { accessToken: auth.access, projectId };
-	}
-
-	throw new Error("Missing Google access token. Log in again.");
-}
-
-async function fetchGoogleGeminiQuotaSnapshot(
-	accessToken: string,
-	projectId: string | undefined,
-	signal?: AbortSignal,
-): Promise<GoogleQuotaAccountSnapshot> {
-	const response = await fetch(GOOGLE_GEMINI_QUOTA_ENDPOINT, {
-		method: "POST",
-		headers: {
-			Authorization: `Bearer ${accessToken}`,
-			Accept: "application/json",
-			"Content-Type": "application/json",
-			...GOOGLE_GEMINI_HEADERS,
-		},
-		body: "{}",
-		signal,
-	});
-	if (!response.ok) {
-		throw new Error(await readResponseError(response));
-	}
-	return parseGoogleGeminiQuotaSnapshot(await response.json(), projectId);
-}
-
-async function fetchGoogleAntigravityQuotaSnapshot(
-	accessToken: string,
-	projectId: string | undefined,
-	signal?: AbortSignal,
-): Promise<GoogleQuotaAccountSnapshot> {
-	let lastError = "Google quota lookup failed";
-
-	for (const endpoint of GOOGLE_ANTIGRAVITY_QUOTA_ENDPOINTS) {
-		const response = await fetch(endpoint, {
-			method: "POST",
-			headers: {
-				Authorization: `Bearer ${accessToken}`,
-				Accept: "application/json",
-				"Content-Type": "application/json",
-				...GOOGLE_ANTIGRAVITY_HEADERS,
-			},
-			body: JSON.stringify(projectId ? { project: projectId } : {}),
-			signal,
-		});
-		if (response.ok) {
-			return parseGoogleAntigravityQuotaSnapshot(await response.json(), endpoint, projectId);
-		}
-		lastError = await readResponseError(response);
-	}
-
-	throw new Error(lastError);
-}
-
-function getGoogleQuotaBucketLabel(account: QuotaAccount, count: number): string {
-	if (account.baseProvider === "google-gemini-cli") {
-		return `${count} ${count === 1 ? "family" : "families"}`;
-	}
-	return `${count} ${count === 1 ? "model" : "models"}`;
-}
-
-function buildGoogleQuotaErrorDetails(
-	account: QuotaAccount,
-	message: string,
-	projectId?: string,
-): string[] {
-	const details = [
-		`account: ${account.displayName}`,
-		`provider: ${account.providerName}`,
-		"status: error",
-	];
-	if (projectId) {
-		details.push(`project: ${projectId}`);
-	}
-	details.push(`details: ${message}`);
-
-	if (/401|unauthorized/i.test(message)) {
-		details.push("login: use /subs login or /login to authenticate this account again");
-		return details;
-	}
-
-	if (/403|permission/i.test(message)) {
-		if (account.baseProvider === "google-gemini-cli") {
-			details.push(
-				"hint: Google Cloud Code Assist rejected quota access for this account; try /subs login again and verify this account still has Gemini quota access",
-			);
-		} else {
-			details.push(
-				"hint: Google rejected this Antigravity quota request; verify the saved project/account pairing is still valid and try /subs login again",
-			);
-		}
-	}
-
-	return details;
-}
-
-function formatGoogleQuotaDetails(
-	account: QuotaAccount,
-	snapshot: GoogleQuotaAccountSnapshot,
-	kind: QuotaStatusKind,
-): string[] {
-	const details = [
-		`account: ${account.displayName}`,
-		`provider: ${account.providerName}`,
-		`status: ${formatQuotaKind(kind)}`,
-	];
-	if (snapshot.projectId) {
-		details.push(`project: ${snapshot.projectId}`);
-	}
-	if (snapshot.worstRemainingPercent !== undefined) {
-		details.push(`bottleneck: ${formatRemainingPercent(snapshot.worstRemainingPercent)} left`);
-	}
-	for (const model of [...snapshot.models].sort((left, right) => {
-		const leftPercent = left.remainingPercent ?? 101;
-		const rightPercent = right.remainingPercent ?? 101;
-		return leftPercent - rightPercent || left.model.localeCompare(right.model);
-	})) {
-		details.push(
-			`${model.model}: ${formatRemainingPercent(model.remainingPercent)} left, resets ${formatResetLong(model.resetAt)}`,
-		);
-	}
-	details.push(`endpoint: ${snapshot.endpoint}`);
-	return details;
-}
-
-async function checkGoogleQuotaAccount(
-	account: QuotaAccount,
-	fetchSnapshot: (
-		accessToken: string,
-		projectId: string | undefined,
-		signal?: AbortSignal,
-	) => Promise<GoogleQuotaAccountSnapshot>,
-	signal?: AbortSignal,
-): Promise<QuotaCheckResult> {
-	const auth = account.auth;
-	if (!auth || auth.type !== "oauth") {
-		return {
-			account,
-			kind: "missing-auth",
-			summary: "not logged in",
-			details: [
-				`account: ${account.displayName}`,
-				`provider: ${account.providerName}`,
-				"status: not logged in",
-				"login: use /subs login or /login to authenticate this account",
-			],
-			score: 0,
-		};
-	}
-	if ((typeof auth.access !== "string" || auth.access.length === 0)
-		&& (typeof auth.refresh !== "string" || auth.refresh.length === 0)) {
-		return {
-			account,
-			kind: "missing-auth",
-			summary: "missing Google tokens",
-			details: [
-				`account: ${account.displayName}`,
-				`provider: ${account.providerName}`,
-				"status: not logged in",
-				"details: saved Google credentials are missing both access and refresh tokens",
-				"login: use /subs login or /login to authenticate this account again",
-			],
-			score: 0,
-		};
-	}
-
-	let projectId: string | undefined;
-
-	try {
-		const credentials = await resolveGoogleQuotaAccess(account, auth);
-		projectId = credentials.projectId;
-		const snapshot = await fetchSnapshot(credentials.accessToken, credentials.projectId, signal);
-		if (snapshot.models.length === 0 || snapshot.worstRemainingPercent === undefined) {
-			return {
-				account,
-				kind: "error",
-				summary: "no model quota data returned",
-				details: [
-					`account: ${account.displayName}`,
-					`provider: ${account.providerName}`,
-					"status: error",
-					...(projectId ? [`project: ${projectId}`] : []),
-					"details: Google returned no usable model quota data",
-					`endpoint: ${snapshot.endpoint}`,
-				],
-				score: 0,
-			};
-		}
-
-		const classification = classifyGoogleQuotaKind(snapshot);
-		return {
-			account,
-			kind: classification.kind,
-			summary: `${getGoogleQuotaBucketLabel(account, snapshot.models.length)} | bottleneck ${formatRemainingPercent(snapshot.worstRemainingPercent)} | ${formatQuotaKind(classification.kind)}`,
-			details: formatGoogleQuotaDetails(account, snapshot, classification.kind),
-			score: classification.score,
-		};
-	} catch (error: unknown) {
-		if (signal?.aborted || isAbortError(error)) throw error;
-		const message = error instanceof Error ? error.message : String(error);
-		return {
-			account,
-			kind: "error",
-			summary: message,
-			details: buildGoogleQuotaErrorDetails(account, message, projectId),
-			score: 0,
-		};
-	}
-}
-
 const codexQuotaChecker: ProviderQuotaChecker = {
 	baseProvider: "openai-codex",
 	async check(account: QuotaAccount, signal?: AbortSignal): Promise<QuotaCheckResult> {
@@ -1125,20 +654,6 @@ const codexQuotaChecker: ProviderQuotaChecker = {
 	},
 };
 
-const googleGeminiCliQuotaChecker: ProviderQuotaChecker = {
-	baseProvider: "google-gemini-cli",
-	async check(account: QuotaAccount, signal?: AbortSignal): Promise<QuotaCheckResult> {
-		return checkGoogleQuotaAccount(account, fetchGoogleGeminiQuotaSnapshot, signal);
-	},
-};
-
-const googleAntigravityQuotaChecker: ProviderQuotaChecker = {
-	baseProvider: "google-antigravity",
-	async check(account: QuotaAccount, signal?: AbortSignal): Promise<QuotaCheckResult> {
-		return checkGoogleQuotaAccount(account, fetchGoogleAntigravityQuotaSnapshot, signal);
-	},
-};
-
 const PROVIDER_QUOTA_CHECKERS: ProviderQuotaChecker[] = [
 	codexQuotaChecker,
 ];
@@ -1204,7 +719,6 @@ function emptyMultiPassConfig(): MultiPassConfig {
 function defaultSetId(baseProvider: string): string {
 	return baseProvider
 		.replace(/^openai-/, "")
-		.replace(/^google-/, "")
 		.replace(/-cli$/, "")
 		.replace(/[^a-z0-9]+/gi, "-")
 		.replace(/^-+|-+$/g, "")
