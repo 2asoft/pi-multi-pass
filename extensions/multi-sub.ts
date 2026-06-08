@@ -18,8 +18,6 @@
  *   - anthropic          (Claude Pro/Max)
  *   - openai-codex       (ChatGPT Plus/Pro Codex)
  *   - github-copilot     (GitHub Copilot)
- *   - google-gemini-cli  (Google Cloud Code Assist)
- *   - google-antigravity (Antigravity)
  */
 
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from "fs";
@@ -29,6 +27,7 @@ import type {
 	ExtensionCommandContext,
 	ExtensionContext,
 	AgentEndEvent,
+	ProviderModelConfig,
 } from "@earendil-works/pi-coding-agent";
 import {
 	DynamicBorder,
@@ -47,12 +46,6 @@ import {
 	refreshGitHubCopilotToken,
 	getGitHubCopilotBaseUrl,
 	normalizeDomain,
-	geminiCliOAuthProvider,
-	loginGeminiCli,
-	refreshGoogleCloudToken,
-	antigravityOAuthProvider,
-	loginAntigravity,
-	refreshAntigravityToken,
 	type OAuthCredentials,
 	type OAuthLoginCallbacks,
 	type OAuthProviderInterface,
@@ -72,7 +65,6 @@ import {
 // ==========================================================================
 
 type CopilotCredentials = OAuthCredentials & { enterpriseUrl?: string };
-type GeminiCredentials = OAuthCredentials & { projectId?: string };
 
 interface ProviderTemplate {
 	displayName: string;
@@ -141,8 +133,7 @@ const PROVIDER_TEMPLATES: Record<string, ProviderTemplate> = {
 				name: `GitHub Copilot #${index}`,
 				async login(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials> {
 					return loginGitHubCopilot({
-						onAuth: (url: string, instructions?: string) =>
-							callbacks.onAuth({ url, instructions }),
+						onDeviceCode: callbacks.onDeviceCode,
 						onPrompt: callbacks.onPrompt,
 						onProgress: callbacks.onProgress,
 						signal: callbacks.signal,
@@ -171,61 +162,6 @@ const PROVIDER_TEMPLATES: Record<string, ProviderTemplate> = {
 		},
 	},
 
-	"google-gemini-cli": {
-		displayName: "Google Cloud Code Assist",
-		builtinOAuth: geminiCliOAuthProvider,
-		usesCallbackServer: true,
-		buildOAuth(index: number) {
-			return {
-				name: `Google Cloud Code Assist #${index}`,
-				usesCallbackServer: true,
-				async login(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials> {
-					return loginGeminiCli(
-						callbacks.onAuth,
-						callbacks.onProgress,
-						callbacks.onManualCodeInput,
-					);
-				},
-				async refreshToken(credentials: OAuthCredentials): Promise<OAuthCredentials> {
-					const creds = credentials as GeminiCredentials;
-					if (!creds.projectId) throw new Error("Missing projectId");
-					return refreshGoogleCloudToken(creds.refresh, creds.projectId);
-				},
-				getApiKey(credentials: OAuthCredentials): string {
-					const creds = credentials as GeminiCredentials;
-					return JSON.stringify({ token: creds.access, projectId: creds.projectId });
-				},
-			};
-		},
-	},
-
-	"google-antigravity": {
-		displayName: "Antigravity",
-		builtinOAuth: antigravityOAuthProvider,
-		usesCallbackServer: true,
-		buildOAuth(index: number) {
-			return {
-				name: `Antigravity #${index}`,
-				usesCallbackServer: true,
-				async login(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials> {
-					return loginAntigravity(
-						callbacks.onAuth,
-						callbacks.onProgress,
-						callbacks.onManualCodeInput,
-					);
-				},
-				async refreshToken(credentials: OAuthCredentials): Promise<OAuthCredentials> {
-					const creds = credentials as GeminiCredentials;
-					if (!creds.projectId) throw new Error("Missing projectId");
-					return refreshAntigravityToken(creds.refresh, creds.projectId);
-				},
-				getApiKey(credentials: OAuthCredentials): string {
-					const creds = credentials as GeminiCredentials;
-					return JSON.stringify({ token: creds.access, projectId: creds.projectId });
-				},
-			};
-		},
-	},
 };
 
 const SUPPORTED_PROVIDERS = Object.keys(PROVIDER_TEMPLATES);
@@ -837,20 +773,12 @@ async function resolveGoogleQuotaAccess(
 	const hasFreshAccess = typeof auth.access === "string"
 		&& auth.access.length > 0
 		&& (typeof auth.expires !== "number" || auth.expires > Date.now() + 60_000);
-	if (hasFreshAccess) {
+	if (hasFreshAccess && typeof auth.access === "string") {
 		return { accessToken: auth.access, projectId };
 	}
 
 	if (typeof auth.refresh === "string" && auth.refresh.length > 0) {
-		const credentials = account.baseProvider === "google-gemini-cli"
-			? await refreshGoogleCloudToken(auth.refresh, projectId || "") as Promise<GeminiCredentials>
-			: await refreshAntigravityToken(auth.refresh, projectId || "") as Promise<GeminiCredentials>;
-		return {
-			accessToken: credentials.access,
-			projectId: typeof credentials.projectId === "string" && credentials.projectId.length > 0
-				? credentials.projectId
-				: projectId,
-		};
+		throw new Error("Google OAuth refresh is unavailable in this pi version. Log in again after pi restores this provider.");
 	}
 
 	if (typeof auth.access === "string" && auth.access.length > 0) {
@@ -1213,8 +1141,6 @@ const googleAntigravityQuotaChecker: ProviderQuotaChecker = {
 
 const PROVIDER_QUOTA_CHECKERS: ProviderQuotaChecker[] = [
 	codexQuotaChecker,
-	googleGeminiCliQuotaChecker,
-	googleAntigravityQuotaChecker,
 ];
 
 async function showQuotaDetails(
@@ -1425,7 +1351,7 @@ function allMembers(config: MultiPassConfig): Array<{ set: EquivalentSet; member
 // Provider registration and model helpers
 // ==========================================================================
 
-function cloneModels(originalProvider: string, index: number): Model<Api>[] {
+function cloneModels(originalProvider: string, index: number): ProviderModelConfig[] {
 	const models = getModels(originalProvider as never) as Model<Api>[];
 	return models.map((model) => ({
 		id: model.id,
@@ -1892,7 +1818,8 @@ async function selectConfiguredMember(
 		})),
 	});
 	if (!selected) return undefined;
-	return entries.find(({ member }) => member.providerName === selected && member);
+	const entry = entries.find(({ member }) => member.providerName === selected);
+	return entry ? { config, ...entry } : undefined;
 }
 
 async function handleSubsLogin(ctx: ExtensionCommandContext): Promise<void> {

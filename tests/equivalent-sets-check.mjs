@@ -84,9 +84,9 @@ function runAddEquivalentCheck() {
 }
 
 function runProviderParsingCheck() {
-  const supported = new Set(["openai-codex", "google-gemini-cli"]);
+  const supported = new Set(["openai-codex", "github-copilot"]);
   assert.equal(getBaseProvider("openai-codex-2", supported), "openai-codex");
-  assert.equal(getBaseProvider("google-gemini-cli-3", supported), "google-gemini-cli");
+  assert.equal(getBaseProvider("github-copilot-3", supported), "github-copilot");
   assert.equal(getBaseProvider("unknown-2", supported), undefined);
 }
 

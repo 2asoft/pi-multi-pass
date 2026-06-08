@@ -98,8 +98,6 @@ No project config is used.
 | `anthropic` | Claude Pro/Max |
 | `openai-codex` | ChatGPT Plus/Pro (Codex) |
 | `github-copilot` | GitHub Copilot |
-| `google-gemini-cli` | Google Cloud Code Assist |
-| `google-antigravity` | Antigravity |
 
 ## Built-in limits support
 
@@ -108,8 +106,6 @@ The `/subs` dashboard uses provider-specific quota checkers.
 Currently implemented:
 
 - `openai-codex`: fetches ChatGPT/Codex usage from `https://chatgpt.com/backend-api/wham/usage` or `CHATGPT_BASE_URL`.
-- `google-gemini-cli`: queries Google Cloud Code Assist quota.
-- `google-antigravity`: queries Antigravity available-model quota.
 
 Automatic switching still happens only after a runtime rate-limit-style error.
 
