@@ -26,7 +26,6 @@ import type {
 	ExtensionAPI,
 	ExtensionCommandContext,
 	ExtensionContext,
-	AgentEndEvent,
 	ProviderModelConfig,
 } from "@earendil-works/pi-coding-agent";
 import {
@@ -706,6 +705,22 @@ interface RuntimeMemberState {
 	exhaustedUntil?: number;
 }
 
+interface AssistantMessageEndEvent {
+	type: "message_end";
+	message: unknown;
+}
+
+interface MessageEndRetryResult {
+	retry: true;
+}
+
+type MessageEndCapableExtensionAPI = Omit<ExtensionAPI, "on"> & {
+	on(
+		event: "message_end",
+		handler: (event: AssistantMessageEndEvent, ctx: ExtensionContext) => Promise<MessageEndRetryResult | undefined>,
+	): void;
+};
+
 const DEFAULT_COOLDOWN_MS = 5 * 60 * 1000;
 
 function globalConfigPath(): string {
@@ -963,18 +978,8 @@ function isRateLimitError(errorMessage: string): boolean {
 class EquivalentSetRuntime {
 	private readonly memberState = new Map<string, RuntimeMemberState>();
 	private readonly roundRobinIndex = new Map<string, number>();
-	private lastPrompt: string | null = null;
-	private suppressNextPrompt = false;
 
 	constructor(private readonly pi: ExtensionAPI) {}
-
-	startTurn(prompt: string): void {
-		if (this.suppressNextPrompt) {
-			this.suppressNextPrompt = false;
-			return;
-		}
-		this.lastPrompt = prompt;
-	}
 
 	markExhausted(providerName: string, cooldownMs: number): void {
 		this.memberState.set(providerName, { exhaustedUntil: Date.now() + cooldownMs });
@@ -1066,10 +1071,6 @@ class EquivalentSetRuntime {
 
 		ctx.ui.notify(`[subs:${set.id}] rate limited on ${currentModel.provider}; switched to ${next.providerName}`, "info");
 		ctx.ui.setStatus("multi-pass", `${set.id} via ${next.providerName}`);
-		if (this.lastPrompt) {
-			this.suppressNextPrompt = true;
-			this.pi.sendUserMessage(this.lastPrompt);
-		}
 		return true;
 	}
 }
@@ -1433,19 +1434,16 @@ export default function multiSub(pi: ExtensionAPI) {
 		}
 	});
 
-	pi.on("before_agent_start", async (event) => {
-		runtime.startTurn(event.prompt);
-	});
-
-	pi.on("agent_end", async (event: AgentEndEvent, ctx: ExtensionContext) => {
-		if (!event.messages || event.messages.length === 0) return;
-		const lastMessage = event.messages[event.messages.length - 1];
-		if (!lastMessage || lastMessage.role !== "assistant") return;
-		const assistant = getRecord(lastMessage);
+	const piWithMessageEnd = pi as MessageEndCapableExtensionAPI;
+	piWithMessageEnd.on("message_end", async (event, ctx): Promise<MessageEndRetryResult | undefined> => {
+		const assistant = getRecord(event.message);
+		if (assistant?.role !== "assistant") return;
 		if (assistant?.stopReason !== "error") return;
 		const errorMessage = typeof assistant.errorMessage === "string" ? assistant.errorMessage : undefined;
 		if (!errorMessage) return;
-		await runtime.handleRateLimit(errorMessage, ctx.model, ctx);
+		if (await runtime.handleRateLimit(errorMessage, ctx.model, ctx)) {
+			return { retry: true };
+		}
 	});
 
 	pi.registerCommand("subs", {
