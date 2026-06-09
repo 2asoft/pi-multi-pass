@@ -710,14 +710,23 @@ interface AssistantMessageEndEvent {
 	message: unknown;
 }
 
-interface MessageEndRetryResult {
+interface CompactionErrorEvent {
+	type: "compaction_error";
+	errorMessage: string;
+}
+
+interface RetryResult {
 	retry: true;
 }
 
-type MessageEndCapableExtensionAPI = Omit<ExtensionAPI, "on"> & {
+type RetryCapableExtensionAPI = Omit<ExtensionAPI, "on"> & {
 	on(
 		event: "message_end",
-		handler: (event: AssistantMessageEndEvent, ctx: ExtensionContext) => Promise<MessageEndRetryResult | undefined>,
+		handler: (event: AssistantMessageEndEvent, ctx: ExtensionContext) => Promise<RetryResult | undefined>,
+	): void;
+	on(
+		event: "compaction_error",
+		handler: (event: CompactionErrorEvent, ctx: ExtensionContext) => Promise<RetryResult | undefined>,
 	): void;
 };
 
@@ -1434,14 +1443,20 @@ export default function multiSub(pi: ExtensionAPI) {
 		}
 	});
 
-	const piWithMessageEnd = pi as MessageEndCapableExtensionAPI;
-	piWithMessageEnd.on("message_end", async (event, ctx): Promise<MessageEndRetryResult | undefined> => {
+	const piWithRetry = pi as unknown as RetryCapableExtensionAPI;
+	piWithRetry.on("message_end", async (event, ctx): Promise<RetryResult | undefined> => {
 		const assistant = getRecord(event.message);
 		if (assistant?.role !== "assistant") return;
 		if (assistant?.stopReason !== "error") return;
 		const errorMessage = typeof assistant.errorMessage === "string" ? assistant.errorMessage : undefined;
 		if (!errorMessage) return;
 		if (await runtime.handleRateLimit(errorMessage, ctx.model, ctx)) {
+			return { retry: true };
+		}
+	});
+
+	piWithRetry.on("compaction_error", async (event, ctx): Promise<RetryResult | undefined> => {
+		if (await runtime.handleRateLimit(event.errorMessage, ctx.model, ctx)) {
 			return { retry: true };
 		}
 	});
