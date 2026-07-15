@@ -26,23 +26,14 @@ import type {
 	ExtensionAPI,
 	ExtensionCommandContext,
 	ExtensionContext,
-	ProviderModelConfig,
 } from "@earendil-works/pi-coding-agent";
 import {
 	DynamicBorder,
 	getAgentDir,
 	keyHint,
+	readStoredCredential,
 } from "@earendil-works/pi-coding-agent";
-import {
-	anthropicOAuthProvider,
-	openaiCodexOAuthProvider,
-	githubCopilotOAuthProvider,
-	getGitHubCopilotBaseUrl,
-	normalizeDomain,
-	type OAuthCredentials,
-	type OAuthProviderInterface,
-} from "@earendil-works/pi-ai/oauth";
-import { getModels, type Api, type Model } from "@earendil-works/pi-ai";
+import type { Api, Model } from "@earendil-works/pi-ai";
 import {
 	Container,
 	Key,
@@ -56,71 +47,14 @@ import {
 // Provider templates
 // ==========================================================================
 
-type CopilotCredentials = OAuthCredentials & { enterpriseUrl?: string };
-
 interface ProviderTemplate {
 	displayName: string;
-	builtinOAuth: OAuthProviderInterface;
-	buildOAuth(index: number): Omit<OAuthProviderInterface, "id">;
-	buildModifyModels?(providerName: string): OAuthProviderInterface["modifyModels"];
-}
-
-function buildEquivalentOAuth(
-	builtinOAuth: OAuthProviderInterface,
-	name: string,
-): Omit<OAuthProviderInterface, "id"> {
-	return {
-		name,
-		usesCallbackServer: builtinOAuth.usesCallbackServer,
-		login(callbacks) {
-			return builtinOAuth.login(callbacks);
-		},
-		refreshToken(credentials) {
-			return builtinOAuth.refreshToken(credentials);
-		},
-		getApiKey(credentials) {
-			return builtinOAuth.getApiKey(credentials);
-		},
-	};
 }
 
 const PROVIDER_TEMPLATES: Record<string, ProviderTemplate> = {
-	anthropic: {
-		displayName: "Anthropic (Claude Pro/Max)",
-		builtinOAuth: anthropicOAuthProvider,
-		buildOAuth(index: number) {
-			return buildEquivalentOAuth(anthropicOAuthProvider, `Anthropic #${index}`);
-		},
-	},
-
-	"openai-codex": {
-		displayName: "ChatGPT Plus/Pro (Codex)",
-		builtinOAuth: openaiCodexOAuthProvider,
-		buildOAuth(index: number) {
-			return buildEquivalentOAuth(openaiCodexOAuthProvider, `ChatGPT Codex #${index}`);
-		},
-	},
-
-	"github-copilot": {
-		displayName: "GitHub Copilot",
-		builtinOAuth: githubCopilotOAuthProvider,
-		buildOAuth(index: number) {
-			return buildEquivalentOAuth(githubCopilotOAuthProvider, `GitHub Copilot #${index}`);
-		},
-		buildModifyModels(providerName: string) {
-			return (models: Model<Api>[], credentials: OAuthCredentials): Model<Api>[] => {
-				const creds = credentials as CopilotCredentials;
-				const domain = creds.enterpriseUrl
-					? (normalizeDomain(creds.enterpriseUrl) ?? undefined)
-					: undefined;
-				const baseUrl = getGitHubCopilotBaseUrl(creds.access, domain);
-				return models.map((m) =>
-					m.provider === providerName ? { ...m, baseUrl } : m,
-				);
-			};
-		},
-	},
-
+	anthropic: { displayName: "Anthropic (Claude Pro/Max)" },
+	"openai-codex": { displayName: "ChatGPT Plus/Pro (Codex)" },
+	"github-copilot": { displayName: "GitHub Copilot" },
 };
 
 const SUPPORTED_PROVIDERS = Object.keys(PROVIDER_TEMPLATES);
@@ -705,31 +639,6 @@ interface RuntimeMemberState {
 	exhaustedUntil?: number;
 }
 
-interface AssistantMessageEndEvent {
-	type: "message_end";
-	message: unknown;
-}
-
-interface CompactionErrorEvent {
-	type: "compaction_error";
-	errorMessage: string;
-}
-
-interface RetryResult {
-	retry: true;
-}
-
-type RetryCapableExtensionAPI = Omit<ExtensionAPI, "on"> & {
-	on(
-		event: "message_end",
-		handler: (event: AssistantMessageEndEvent, ctx: ExtensionContext) => Promise<RetryResult | undefined>,
-	): void;
-	on(
-		event: "compaction_error",
-		handler: (event: CompactionErrorEvent, ctx: ExtensionContext) => Promise<RetryResult | undefined>,
-	): void;
-};
-
 const DEFAULT_COOLDOWN_MS = 5 * 60 * 1000;
 
 function globalConfigPath(): string {
@@ -889,38 +798,14 @@ function allMembers(config: MultiPassConfig): Array<{ set: EquivalentSet; member
 // Provider registration and model helpers
 // ==========================================================================
 
-function cloneModels(originalProvider: string, index: number): ProviderModelConfig[] {
-	const models = getModels(originalProvider as never) as Model<Api>[];
-	return models.map((model) => ({
-		id: model.id,
-		name: `${model.name} (#${index})`,
-		api: model.api,
-		reasoning: model.reasoning,
-		thinkingLevelMap: model.thinkingLevelMap ? { ...model.thinkingLevelMap } : undefined,
-		input: model.input as ("text" | "image")[],
-		cost: { ...model.cost },
-		contextWindow: model.contextWindow,
-		maxTokens: model.maxTokens,
-		headers: model.headers ? { ...model.headers } : undefined,
-		compat: model.compat,
-	}));
-}
-
 function registerEquivalentProvider(pi: ExtensionAPI, providerName: string): void {
 	const baseProvider = getBaseProvider(providerName);
 	if (!baseProvider || baseProvider === providerName) return;
 	const index = memberIndex(providerName, baseProvider);
 	if (!index || index < 2) return;
-	const template = PROVIDER_TEMPLATES[baseProvider];
-	if (!template) return;
-	const oauth = template.buildOAuth(index);
-	const modifyModels = template.buildModifyModels?.(providerName);
-	const builtinModels = getModels(baseProvider as never) as Model<Api>[];
 	pi.registerProvider(providerName, {
-		baseUrl: builtinModels[0]?.baseUrl || "",
-		api: builtinModels[0]?.api,
-		oauth: modifyModels ? { ...oauth, modifyModels } : oauth,
-		models: cloneModels(baseProvider, index),
+		sourceProvider: baseProvider,
+		name: `${PROVIDER_TEMPLATES[baseProvider]?.displayName || baseProvider} #${index}`,
 	});
 }
 
@@ -935,13 +820,7 @@ function findProviderModel(ctx: ExtensionContext | ExtensionCommandContext, prov
 		const preferred = ctx.modelRegistry.find(providerName, preferredModelId);
 		if (preferred) return preferred as Model<Api>;
 	}
-	const baseProvider = getBaseProvider(providerName);
-	if (!baseProvider) return undefined;
-	for (const baseModel of getModels(baseProvider as never) as Model<Api>[]) {
-		const candidate = ctx.modelRegistry.find(providerName, baseModel.id);
-		if (candidate) return candidate as Model<Api>;
-	}
-	return undefined;
+	return ctx.modelRegistry.getAll().find((model) => model.provider === providerName) as Model<Api> | undefined;
 }
 
 // ==========================================================================
@@ -959,7 +838,7 @@ function collectQuotaAccounts(ctx: ExtensionContext | ExtensionCommandContext, c
 			providerName: member.providerName,
 			baseProvider: set.baseProvider,
 			displayName: memberDisplayName(member, set),
-			auth: ctx.modelRegistry.authStorage.get(member.providerName) as AuthStorageEntry | undefined,
+			auth: readStoredCredential(member.providerName) as AuthStorageEntry | undefined,
 		});
 	}
 	return accounts;
@@ -1027,21 +906,21 @@ class EquivalentSetRuntime {
 		currentProvider: string,
 		ctx: ExtensionContext,
 	): Promise<EquivalentMember | undefined> {
-		const candidates = this.availableMembers(set, ctx.modelRegistry.authStorage)
+		const candidates = this.availableMembers(set, ctx.modelRegistry)
 			.filter((member) => member.providerName !== currentProvider);
 		if (candidates.length === 0) return undefined;
 		const accounts = candidates.map((member) => ({
 			providerName: member.providerName,
 			baseProvider: set.baseProvider,
 			displayName: memberDisplayName(member, set),
-			auth: ctx.modelRegistry.authStorage.get(member.providerName) as AuthStorageEntry | undefined,
+			auth: readStoredCredential(member.providerName) as AuthStorageEntry | undefined,
 		}));
 		const results = await runQuotaChecks(accounts);
 		const bestReady = results.find((result) => result.kind !== "error" && result.kind !== "missing-auth");
 		if (bestReady) {
 			return candidates.find((member) => member.providerName === bestReady.account.providerName);
 		}
-		return this.chooseRoundRobin(set, currentProvider, ctx.modelRegistry.authStorage);
+		return this.chooseRoundRobin(set, currentProvider, ctx.modelRegistry);
 	}
 
 	private async chooseNext(set: EquivalentSet, currentProvider: string, ctx: ExtensionContext): Promise<EquivalentMember | undefined> {
@@ -1049,7 +928,7 @@ class EquivalentSetRuntime {
 		if (set.autoSwitch.strategy === "quota-first") {
 			return this.chooseQuotaFirst(set, currentProvider, ctx);
 		}
-		return this.chooseRoundRobin(set, currentProvider, ctx.modelRegistry.authStorage);
+		return this.chooseRoundRobin(set, currentProvider, ctx.modelRegistry);
 	}
 
 	async handleRateLimit(errorMessage: string, currentModel: Model<Api> | undefined, ctx: ExtensionContext): Promise<boolean> {
@@ -1121,7 +1000,7 @@ async function handleSubsAdd(pi: ExtensionAPI, ctx: ExtensionCommandContext, req
 	if (!set.autoSwitch.strategy) set.autoSwitch.strategy = "quota-first";
 	saveGlobalConfig(config);
 	registerEquivalentProvider(pi, providerName);
-	ctx.ui.notify(`Added ${providerName}. Use /login and select ${PROVIDER_TEMPLATES[baseProvider]?.buildOAuth(memberIndex(providerName, baseProvider) || 2).name}.`, "info");
+	ctx.ui.notify(`Added ${providerName}. Authenticate it with /login ${providerName}.`, "info");
 }
 
 interface DashboardMemberState {
@@ -1146,7 +1025,7 @@ async function buildDashboardState(ctx: ExtensionCommandContext): Promise<Dashbo
 		members: allMembers(config).map(({ set, member }) => ({
 			set,
 			member,
-			authed: ctx.modelRegistry.authStorage.hasAuth(member.providerName),
+			authed: ctx.modelRegistry.hasAuth(member.providerName),
 			current: ctx.model?.provider === member.providerName,
 			quota: quotaByProvider.get(member.providerName),
 		})),
@@ -1191,11 +1070,8 @@ function dashboardItems(state: DashboardState): SelectItem[] {
 	return items;
 }
 
-function loginInstructionForMember(set: EquivalentSet, member: EquivalentMember): string {
-	const index = memberIndex(member.providerName, set.baseProvider);
-	return member.providerName === set.baseProvider
-		? PROVIDER_TEMPLATES[set.baseProvider]?.builtinOAuth.name || set.baseProvider
-		: PROVIDER_TEMPLATES[set.baseProvider]?.buildOAuth(index || 2).name || member.providerName;
+function loginInstructionForMember(_set: EquivalentSet, member: EquivalentMember): string {
+	return `/login ${member.providerName}`;
 }
 
 async function switchToProvider(pi: ExtensionAPI, ctx: ExtensionCommandContext, providerName: string): Promise<void> {
@@ -1212,7 +1088,7 @@ async function handleDashboardSetActions(ctx: ExtensionCommandContext, config: M
 	while (true) {
 		const action = await showWrappedSelect(ctx, {
 			title: `Set: ${set.id}`,
-			subtitle: formatDashboardSetDescription(set, set.members.map((member) => ({ set, member, authed: ctx.modelRegistry.authStorage.hasAuth(member.providerName), current: ctx.model?.provider === member.providerName }))),
+			subtitle: formatDashboardSetDescription(set, set.members.map((member) => ({ set, member, authed: ctx.modelRegistry.hasAuth(member.providerName), current: ctx.model?.provider === member.providerName }))),
 			items: [
 				{ value: "toggle-auto", label: "toggle auto-switch", description: `currently ${set.autoSwitch.enabled ? "on" : "off"}` },
 				{ value: "strategy-quota-first", label: "strategy: quota-first", description: "prefer account with most quota" },
@@ -1267,7 +1143,7 @@ async function handleDashboardMemberActions(
 		return;
 	}
 	if (action === "logout") {
-		ctx.modelRegistry.authStorage.logout(member.providerName);
+		await ctx.modelRegistry.logout(member.providerName);
 		ctx.ui.notify(`Logged out ${member.providerName}.`, "info");
 		return;
 	}
@@ -1276,7 +1152,7 @@ async function handleDashboardMemberActions(
 		const confirmed = await ctx.ui.confirm("Remove account", `Remove ${member.providerName}? Auth for this account will also be cleared.`);
 		if (!confirmed) return;
 		set.members = set.members.filter((candidate) => candidate.providerName !== member.providerName);
-		ctx.modelRegistry.authStorage.logout(member.providerName);
+		await ctx.modelRegistry.logout(member.providerName);
 		pi.unregisterProvider(member.providerName);
 		saveGlobalConfig(config);
 		ctx.ui.notify(`Removed ${member.providerName}.`, "info");
@@ -1338,7 +1214,7 @@ async function selectConfiguredMember(
 		items: entries.map(({ set, member }) => ({
 			value: member.providerName,
 			label: member.providerName,
-			description: formatMemberLine(member, set, ctx.modelRegistry.authStorage),
+			description: formatMemberLine(member, set, ctx.modelRegistry),
 		})),
 	});
 	if (!selected) return undefined;
@@ -1347,20 +1223,15 @@ async function selectConfiguredMember(
 }
 
 async function handleSubsLogin(ctx: ExtensionCommandContext): Promise<void> {
-	const selected = await selectConfiguredMember(ctx, "Login Equivalent Subscription", (_set, member) => !ctx.modelRegistry.authStorage.hasAuth(member.providerName));
+	const selected = await selectConfiguredMember(ctx, "Login Equivalent Subscription", (_set, member) => !ctx.modelRegistry.hasAuth(member.providerName));
 	if (!selected) return;
-	const baseProvider = selected.set.baseProvider;
-	const index = memberIndex(selected.member.providerName, baseProvider);
-	const name = selected.member.providerName === baseProvider
-		? PROVIDER_TEMPLATES[baseProvider]?.builtinOAuth.name || baseProvider
-		: PROVIDER_TEMPLATES[baseProvider]?.buildOAuth(index || 2).name || selected.member.providerName;
-	ctx.ui.notify(`Use /login and select "${name}".`, "info");
+	ctx.ui.notify(`Use /login ${selected.member.providerName}.`, "info");
 }
 
 async function handleSubsLogout(ctx: ExtensionCommandContext): Promise<void> {
-	const selected = await selectConfiguredMember(ctx, "Logout Equivalent Subscription", (_set, member) => ctx.modelRegistry.authStorage.hasAuth(member.providerName));
+	const selected = await selectConfiguredMember(ctx, "Logout Equivalent Subscription", (_set, member) => ctx.modelRegistry.hasAuth(member.providerName));
 	if (!selected) return;
-	ctx.modelRegistry.authStorage.logout(selected.member.providerName);
+	await ctx.modelRegistry.logout(selected.member.providerName);
 	ctx.ui.notify(`Logged out ${selected.member.providerName}.`, "info");
 }
 
@@ -1370,7 +1241,7 @@ async function handleSubsRemove(pi: ExtensionAPI, ctx: ExtensionCommandContext):
 	const confirmed = await ctx.ui.confirm("Remove account", `Remove ${selected.member.providerName}? Auth for this account will also be cleared.`);
 	if (!confirmed) return;
 	selected.set.members = selected.set.members.filter((member) => member.providerName !== selected.member.providerName);
-	ctx.modelRegistry.authStorage.logout(selected.member.providerName);
+	await ctx.modelRegistry.logout(selected.member.providerName);
 	pi.unregisterProvider(selected.member.providerName);
 	saveGlobalConfig(selected.config);
 	ctx.ui.notify(`Removed ${selected.member.providerName}.`, "info");
@@ -1380,7 +1251,7 @@ async function handleSubsSwitch(pi: ExtensionAPI, ctx: ExtensionCommandContext, 
 	const config = loadGlobalConfig();
 	let providerName = requestedProvider?.trim();
 	if (!providerName) {
-		const entries = allMembers(config).filter(({ member }) => ctx.modelRegistry.authStorage.hasAuth(member.providerName));
+		const entries = allMembers(config).filter(({ member }) => ctx.modelRegistry.hasAuth(member.providerName));
 		if (entries.length === 0) {
 			ctx.ui.notify("No logged-in equivalent accounts available.", "info");
 			return;
@@ -1390,7 +1261,7 @@ async function handleSubsSwitch(pi: ExtensionAPI, ctx: ExtensionCommandContext, 
 			items: entries.map(({ set, member }) => ({
 				value: member.providerName,
 				label: member.providerName,
-				description: formatMemberLine(member, set, ctx.modelRegistry.authStorage),
+				description: formatMemberLine(member, set, ctx.modelRegistry),
 			})),
 			initialValue: ctx.model?.provider,
 			confirmHint: "switch",
@@ -1443,8 +1314,7 @@ export default function multiSub(pi: ExtensionAPI) {
 		}
 	});
 
-	const piWithRetry = pi as unknown as RetryCapableExtensionAPI;
-	piWithRetry.on("message_end", async (event, ctx): Promise<RetryResult | undefined> => {
+	pi.on("message_end", async (event, ctx) => {
 		const assistant = getRecord(event.message);
 		if (assistant?.role !== "assistant") return;
 		if (assistant?.stopReason !== "error") return;
@@ -1455,7 +1325,7 @@ export default function multiSub(pi: ExtensionAPI) {
 		}
 	});
 
-	piWithRetry.on("compaction_error", async (event, ctx): Promise<RetryResult | undefined> => {
+	pi.on("compaction_error", async (event, ctx) => {
 		if (await runtime.handleRateLimit(event.errorMessage, ctx.model, ctx)) {
 			return { retry: true };
 		}
