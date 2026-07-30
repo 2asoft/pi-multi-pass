@@ -30,7 +30,7 @@ Each account can be enabled or disabled for automatic switching. Disabled accoun
 /subs switch    Manually switch account
 ```
 
-When the active account returns a rate-limit-style runtime error, multi-pass can switch to another enabled equivalent account and ask pi to retry the same turn with the same model ID. The failed assistant error stays in session history, but the user prompt is not duplicated in model context.
+When the active account returns a quota-exhaustion runtime error, multi-pass can switch to another enabled equivalent account and ask pi to retry the same turn with the same model ID. Server overload, capacity, and other non-quota errors do not switch accounts. The failed assistant error stays in session history, but the user prompt is not duplicated in model context.
 
 ## Commands
 
@@ -107,7 +107,7 @@ Currently implemented:
 
 - `openai-codex`: fetches ChatGPT/Codex usage from `https://chatgpt.com/backend-api/wham/usage` or `CHATGPT_BASE_URL`.
 
-Automatic switching still happens only after a runtime rate-limit-style error. On pi versions that support `message_end` retry requests, automatic switching uses true retry instead of replaying the prompt.
+Automatic switching happens only after a runtime quota-exhaustion error, not server overload, capacity, or other non-quota errors. On pi versions that support `message_end` retry requests, automatic switching uses true retry instead of replaying the prompt.
 
 ## License
 

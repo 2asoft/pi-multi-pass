@@ -848,19 +848,17 @@ function collectQuotaAccounts(ctx: ExtensionContext | ExtensionCommandContext, c
 // Auto-switch engine
 // ==========================================================================
 
-const RATE_LIMIT_PATTERNS = [
+const QUOTA_EXHAUSTION_PATTERNS = [
 	/usage.?limit/i,
 	/rate.?limit/i,
 	/limit.*reached/i,
 	/too many requests/i,
-	/overloaded/i,
-	/capacity/i,
 	/429/,
 	/quota/i,
 ];
 
-function isRateLimitError(errorMessage: string): boolean {
-	return RATE_LIMIT_PATTERNS.some((pattern) => pattern.test(errorMessage));
+function isQuotaExhaustionError(errorMessage: string): boolean {
+	return QUOTA_EXHAUSTION_PATTERNS.some((pattern) => pattern.test(errorMessage));
 }
 
 class EquivalentSetRuntime {
@@ -932,7 +930,7 @@ class EquivalentSetRuntime {
 	}
 
 	async handleRateLimit(errorMessage: string, currentModel: Model<Api> | undefined, ctx: ExtensionContext): Promise<boolean> {
-		if (!currentModel || !isRateLimitError(errorMessage)) return false;
+		if (!currentModel || !isQuotaExhaustionError(errorMessage)) return false;
 		const config = loadGlobalConfig();
 		const set = findSetForProvider(config, currentModel.provider);
 		if (!set || !set.autoSwitch.enabled) return false;
