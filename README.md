@@ -28,6 +28,7 @@ Each account can be enabled or disabled for automatic switching. Disabled accoun
 /subs add       Add an equivalent account for a provider
 /login          Authenticate the new account
 /subs switch    Manually switch account
+/subs prime     Send a minimal request so the quota timer starts
 ```
 
 When the active account returns a quota-exhaustion runtime error, multi-pass can switch to another enabled equivalent account and ask pi to retry the same turn with the same model ID. Server overload, capacity, and other non-quota errors do not switch accounts. The failed assistant error stays in session history, but the user prompt is not duplicated in model context.
@@ -38,12 +39,17 @@ When the active account returns a quota-exhaustion runtime error, multi-pass can
 /subs              Open the subscription dashboard
 /subs add          Add an equivalent account
 /subs switch       Quick manual switch
+/subs prime        Send a minimal request to start the quota timer
 /subs login        Shortcut to login instructions
 /subs logout       Shortcut to log out an account
 /subs remove       Shortcut to remove an account
 ```
 
-The dashboard always refreshes quota and combines status, limits, and auto-switch settings. Select a set to change its auto-switch policy or strategy. Select an account to switch, toggle auto/manual, view quota details, login/logout, or remove it.
+The dashboard always refreshes quota and combines status, limits, and auto-switch settings. Select a set to change its auto-switch policy or strategy. Select an account to switch, toggle auto/manual, prime the subscription, view quota details, login/logout, or remove it.
+
+## Prime subscription
+
+Some providers only start a rolling quota window after the first real model request. Use `/subs prime` or the dashboard **prime subscription** action to send the smallest practical completion for a logged-in account. multi-pass keeps the current session model unchanged, prefers the current model id when that account can serve it, otherwise picks the cheapest available model, and refreshes quota details afterward when a checker exists.
 
 ## Auto-switch strategies
 

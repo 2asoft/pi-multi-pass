@@ -5,8 +5,9 @@
  * Each extra account gets its own provider name, /login entry, and cloned models.
  *
  * Features:
- *   - /subs: manage subscriptions (add, remove, login, logout, status)
+ *   - /subs: manage subscriptions (add, remove, login, logout, status, prime)
  *   - /subs: manage equivalent subscription accounts and auto-switching
+ *   - /subs prime: send a minimal request so a subscription quota timer starts
  *
  * Auto-switching: equivalent accounts for the same base provider can be
  * enabled for automatic failover on rate-limit-style runtime errors.
@@ -823,6 +824,105 @@ function findProviderModel(ctx: ExtensionContext | ExtensionCommandContext, prov
 	return ctx.modelRegistry.getAll().find((model) => model.provider === providerName) as Model<Api> | undefined;
 }
 
+function pickPrimeModel(models: Model<Api>[], preferredModelId?: string): Model<Api> | undefined {
+	if (models.length === 0) return undefined;
+	if (preferredModelId) {
+		const preferred = models.find((model) => model.id === preferredModelId);
+		if (preferred) return preferred;
+	}
+	return [...models].sort((left, right) => {
+		const leftCost = typeof left.cost?.input === "number" ? left.cost.input : Number.POSITIVE_INFINITY;
+		const rightCost = typeof right.cost?.input === "number" ? right.cost.input : Number.POSITIVE_INFINITY;
+		return leftCost - rightCost || left.id.localeCompare(right.id);
+	})[0];
+}
+
+function findPrimeModel(
+	ctx: ExtensionContext | ExtensionCommandContext,
+	providerName: string,
+	preferredModelId?: string,
+): Model<Api> | undefined {
+	const models = ctx.modelRegistry.getAll().filter((model) => model.provider === providerName) as Model<Api>[];
+	return pickPrimeModel(models, preferredModelId);
+}
+
+function buildPrimeContext(now = Date.now()): {
+	systemPrompt: string;
+	messages: Array<{ role: "user"; content: string; timestamp: number }>;
+} {
+	return {
+		systemPrompt: "Reply with the single character y.",
+		messages: [{ role: "user", content: "y", timestamp: now }],
+	};
+}
+
+function formatPrimeResult(options: {
+	providerName: string;
+	modelId: string;
+	response: { stopReason: string; errorMessage?: string; usage?: { input?: number; output?: number } };
+	quotaSummary?: string;
+}): { ok: boolean; message: string } {
+	const { providerName, modelId, response, quotaSummary } = options;
+	if (response.stopReason === "error" || response.stopReason === "aborted") {
+		return {
+			ok: false,
+			message: `Prime failed for ${providerName}: ${response.errorMessage || response.stopReason}`,
+		};
+	}
+	const input = response.usage?.input;
+	const output = response.usage?.output;
+	const tokenPart = typeof input === "number" && typeof output === "number"
+		? `tokens in=${input} out=${output}`
+		: "request completed";
+	const quotaPart = quotaSummary ? ` | ${quotaSummary}` : "";
+	return {
+		ok: true,
+		message: `Primed ${providerName} via ${modelId}: ${tokenPart}${quotaPart}`,
+	};
+}
+
+async function primeSubscription(
+	ctx: ExtensionCommandContext,
+	member: EquivalentMember,
+	set: EquivalentSet,
+): Promise<void> {
+	if (!ctx.modelRegistry.hasAuth(member.providerName)) {
+		ctx.ui.notify(`${member.providerName} is not logged in. Authenticate it before priming.`, "warning");
+		return;
+	}
+
+	const model = findPrimeModel(ctx, member.providerName, ctx.model?.id);
+	if (!model) {
+		ctx.ui.notify(`No models available for ${member.providerName}.`, "warning");
+		return;
+	}
+
+	ctx.ui.notify(`Priming ${member.providerName} via ${model.id}...`, "info");
+	try {
+		const response = await ctx.modelRegistry.complete(model, buildPrimeContext(), { maxTokens: 16 });
+		let quotaSummary: string | undefined;
+		if (PROVIDER_QUOTA_CHECKERS.some((checker) => checker.baseProvider === set.baseProvider)) {
+			const [quota] = await runQuotaChecks([{
+				providerName: member.providerName,
+				baseProvider: set.baseProvider,
+				displayName: memberDisplayName(member, set),
+				auth: readStoredCredential(member.providerName) as AuthStorageEntry | undefined,
+			}]);
+			quotaSummary = quota?.summary;
+		}
+		const result = formatPrimeResult({
+			providerName: member.providerName,
+			modelId: model.id,
+			response,
+			quotaSummary,
+		});
+		ctx.ui.notify(result.message, result.ok ? "info" : "warning");
+	} catch (error: unknown) {
+		const message = error instanceof Error ? error.message : String(error);
+		ctx.ui.notify(`Prime failed for ${member.providerName}: ${message}`, "warning");
+	}
+}
+
 // ==========================================================================
 // Quota account collection and limits UI
 // ==========================================================================
@@ -1118,6 +1218,13 @@ async function handleDashboardMemberActions(
 		{ value: "login", label: "login instructions", description: `Select ${loginInstructionForMember(set, member)} from /login` },
 		{ value: "logout", label: "logout", description: state.authed ? "Clear saved auth for this account" : "Not logged in" },
 	];
+	if (state.authed) {
+		actions.push({
+			value: "prime",
+			label: "prime subscription",
+			description: "Send the smallest request so the server quota timer starts",
+		});
+	}
 	if (quota) actions.push({ value: "quota", label: "quota details", description: quota.summary });
 	if (member.providerName !== set.baseProvider) actions.push({ value: "remove", label: "remove", description: "Remove this equivalent account" });
 
@@ -1145,6 +1252,7 @@ async function handleDashboardMemberActions(
 		ctx.ui.notify(`Logged out ${member.providerName}.`, "info");
 		return;
 	}
+	if (action === "prime") return primeSubscription(ctx, member, set);
 	if (action === "quota" && quota) return showQuotaDetails(ctx, quota);
 	if (action === "remove") {
 		const confirmed = await ctx.ui.confirm("Remove account", `Remove ${member.providerName}? Auth for this account will also be cleared.`);
@@ -1275,6 +1383,27 @@ async function handleSubsSwitch(pi: ExtensionAPI, ctx: ExtensionCommandContext, 
 	ctx.ui.notify(success ? `Switched to ${providerName}/${model.id}.` : `Failed to switch to ${providerName}.`, success ? "info" : "warning");
 }
 
+async function handleSubsPrime(ctx: ExtensionCommandContext, requestedProvider?: string): Promise<void> {
+	const config = loadGlobalConfig();
+	let providerName = requestedProvider?.trim();
+	if (!providerName) {
+		const selected = await selectConfiguredMember(
+			ctx,
+			"Prime Subscription",
+			(_set, member) => ctx.modelRegistry.hasAuth(member.providerName),
+		);
+		if (!selected) return;
+		return primeSubscription(ctx, selected.member, selected.set);
+	}
+
+	const entry = allMembers(config).find(({ member }) => member.providerName === providerName);
+	if (!entry) {
+		ctx.ui.notify(`Unknown equivalent account: ${providerName}`, "warning");
+		return;
+	}
+	return primeSubscription(ctx, entry.member, entry.set);
+}
+
 
 async function dispatchSubsCommand(pi: ExtensionAPI, ctx: ExtensionCommandContext, command: string, rest: string): Promise<void> {
 	switch (command) {
@@ -1290,6 +1419,8 @@ async function dispatchSubsCommand(pi: ExtensionAPI, ctx: ExtensionCommandContex
 			return handleSubsRemove(pi, ctx);
 		case "switch":
 			return handleSubsSwitch(pi, ctx, rest || undefined);
+		case "prime":
+			return handleSubsPrime(ctx, rest || undefined);
 		default:
 			ctx.ui.notify(`Unknown /subs command: ${command}`, "warning");
 			return;
@@ -1332,7 +1463,7 @@ export default function multiSub(pi: ExtensionAPI) {
 	pi.registerCommand("subs", {
 		description: "Manage equivalent OAuth subscriptions",
 		getArgumentCompletions: (prefix: string) => {
-			const subcommands = ["add", "remove", "login", "logout", "switch"];
+			const subcommands = ["add", "remove", "login", "logout", "switch", "prime"];
 			const filtered = subcommands.filter((subcommand) => subcommand.startsWith(prefix));
 			return filtered.length > 0 ? filtered.map((subcommand) => ({ value: subcommand, label: subcommand })) : null;
 		},
