@@ -1095,8 +1095,56 @@ function isQuotaExhaustionError(errorMessage: string): boolean {
 class EquivalentSetRuntime {
 	private readonly memberState = new Map<string, RuntimeMemberState>();
 	private readonly roundRobinIndex = new Map<string, number>();
+	private externalModelSelectionVersion = 0;
+	private latestExternalModel: Model<Api> | undefined;
+	private routingTarget: string | undefined;
 
 	constructor(private readonly pi: ExtensionAPI) {}
+
+	private modelKey(model: Model<Api>): string {
+		return `${model.provider}\0${model.id}`;
+	}
+
+	observeModelSelection(model: Model<Api>): void {
+		if (this.routingTarget === this.modelKey(model)) return;
+		this.externalModelSelectionVersion++;
+		this.latestExternalModel = model;
+	}
+
+	private async restoreLatestExternalSelection(ctx: ExtensionContext): Promise<void> {
+		while (this.latestExternalModel) {
+			const model = this.latestExternalModel;
+			const version = this.externalModelSelectionVersion;
+			if (ctx.model && this.modelKey(ctx.model) === this.modelKey(model)) return;
+			this.routingTarget = this.modelKey(model);
+			try {
+				if (!await this.pi.setModel(model)) return;
+			} finally {
+				this.routingTarget = undefined;
+			}
+			if (this.externalModelSelectionVersion === version) return;
+		}
+	}
+
+	private async setModelUnlessSuperseded(
+		logicalModel: Model<Api>,
+		targetModel: Model<Api>,
+		ctx: ExtensionContext,
+	): Promise<"selected" | "superseded" | "failed"> {
+		const version = this.externalModelSelectionVersion;
+		if (!ctx.model || this.modelKey(ctx.model) !== this.modelKey(logicalModel)) return "superseded";
+		this.routingTarget = this.modelKey(targetModel);
+		let success: boolean;
+		try {
+			success = await this.pi.setModel(targetModel);
+		} finally {
+			this.routingTarget = undefined;
+		}
+		if (!success) return "failed";
+		if (this.externalModelSelectionVersion === version) return "selected";
+		await this.restoreLatestExternalSelection(ctx);
+		return "superseded";
+	}
 
 	markExhausted(providerName: string, cooldownMs: number, retryAt?: number): void {
 		this.memberState.set(providerName, {
@@ -1221,7 +1269,14 @@ class EquivalentSetRuntime {
 			return "unavailable";
 		}
 		const nextModel = ctx.modelRegistry.find(next.providerName, currentModel.id);
-		if (!nextModel || !await this.pi.setModel(nextModel)) {
+		if (!nextModel) {
+			ctx.ui.notify(`[subs:${set.id}] failed to select ${next.providerName}`, "warning");
+			ctx.ui.setStatus("multi-pass", `${set.id}: unavailable`);
+			return "unavailable";
+		}
+		const selection = await this.setModelUnlessSuperseded(currentModel, nextModel, ctx);
+		if (selection === "superseded") return "not-requested";
+		if (selection === "failed") {
 			ctx.ui.notify(`[subs:${set.id}] failed to select ${next.providerName}`, "warning");
 			ctx.ui.setStatus("multi-pass", `${set.id}: unavailable`);
 			return "unavailable";
@@ -1799,6 +1854,14 @@ export default function multiSub(pi: ExtensionAPI) {
 		if (initialSelection === "not-requested" && enabled.length > 0) {
 			ctx.ui.setStatus("multi-pass", enabled.map((set) => `${set.id}:${set.autoSwitch.strategy}`).join(" | "));
 		}
+	});
+
+	pi.on("model_select", (event) => {
+		runtime.observeModelSelection(event.model);
+	});
+
+	pi.on("before_agent_start", async (_event, ctx) => {
+		await runtime.handleInitialSelection(ctx.model, ctx);
 	});
 
 	pi.on("message_end", async (event, ctx) => {

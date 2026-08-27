@@ -55,7 +55,7 @@ Each configured set exposes a logical provider named `multi-pass-<set-id>`. Use 
 pi --model multi-pass-codex/gpt-5.6-sol
 ```
 
-The logical provider preserves the requested model ID. The extension applies the set's normal strategy, switches to the selected concrete provider during `session_start`, and continues to use the same rules for later quota failover. Choosing a concrete provider bypasses initial selection:
+The logical provider preserves the requested model ID. The extension applies the set's normal strategy and switches to the selected concrete provider during CLI startup or before the next request after an in-session model selection. It continues to use the same rules for later quota failover. Choosing a concrete provider bypasses initial selection:
 
 ```bash
 pi --model openai-codex-8/gpt-5.6-sol

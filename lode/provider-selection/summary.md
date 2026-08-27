@@ -17,7 +17,7 @@ Provider selection chooses a concrete account for initial CLI routing and quota 
 
 ## Initial CLI routing
 
-Each set registers a logical provider named `multi-pass-<set-id>` with a static copy of the base provider's built-in model catalog. It has ambient internal auth, no login flow, and a local error stream instead of upstream request behavior. During `session_start`, the extension replaces an explicitly requested logical model with a selected concrete member serving the same model ID. A concrete provider request bypasses initial selection. If selection cannot produce a target, the logical provider returns the routing error without an upstream model request.
+Each set registers a logical provider named `multi-pass-<set-id>` with a static copy of the base provider's built-in model catalog. It has ambient internal auth, no login flow, and a local error stream instead of upstream request behavior. During `session_start` or the next `before_agent_start`, the extension replaces an explicitly requested logical model with a selected concrete member serving the same model ID. A concrete provider request bypasses initial selection. If selection cannot produce a target, the logical provider returns the routing error without an upstream model request.
 
 ## Selection flow
 
@@ -40,5 +40,5 @@ After quota exhaustion, the failed provider is unavailable until the quota check
 - `extensions/provider-selection.ts`: config normalization and provider-neutral quota-first bucket planning.
 - `extensions/multi-sub.ts`: eligibility, quota checks, round-robin state, dashboard management, and retry integration.
 - `tests/provider-buckets-check.mjs`: logical provider naming, strict ordering, blocked-bucket advancement, and unknown-quota fallback.
-- `tests/logical-provider-check.mjs`: pre-request concrete selection and local fail-closed behavior through Pi.
+- `tests/logical-provider-check.mjs`: startup and in-session concrete selection plus local fail-closed behavior through Pi.
 - `README.md`: operator-facing configuration and behavior.

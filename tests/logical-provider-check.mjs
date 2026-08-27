@@ -3,7 +3,9 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
+import { createInterface } from "node:readline";
+import { once } from "node:events";
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const pi = join(root, "node_modules", ".bin", "pi");
@@ -66,6 +68,77 @@ function runInitialSelectionCheck() {
   assert.equal(response?.data?.model?.id, "claude-sonnet-4-6");
 }
 
+async function runInSessionSelectionCheck() {
+  const agentDir = mkdtempSync(join(tmpdir(), "pi-multi-pass-"));
+  writeFileSync(
+    join(agentDir, "multi-pass.json"),
+    JSON.stringify(setConfig({ id: "anthropic", baseProvider: "anthropic", providerName: "anthropic" })),
+  );
+  const child = spawn(pi, [
+    "--no-extensions",
+    "-e", root,
+    "--offline",
+    "--model", "anthropic/claude-sonnet-4-6",
+    "--mode", "rpc",
+    "--no-session",
+  ], {
+    cwd: root,
+    env: {
+      ...process.env,
+      ANTHROPIC_API_KEY: "unused-test-key",
+      PI_CODING_AGENT_DIR: agentDir,
+    },
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  const lines = createInterface({ input: child.stdout });
+  let stderr = "";
+  child.stderr.setEncoding("utf8");
+  child.stderr.on("data", (chunk) => { stderr += chunk; });
+
+  try {
+    const response = await new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error(`RPC timeout: ${stderr}`)), 10000);
+      lines.on("line", (line) => {
+        try {
+          const event = JSON.parse(line);
+          if (event.id === "set") {
+            assert.equal(event.success, true);
+            assert.equal(event.command, "set_model");
+            assert.equal(event.data?.provider, "multi-pass-anthropic");
+            child.stdin.write(`${JSON.stringify({ id: "prompt", type: "prompt", message: "test" })}\n`);
+          } else if (event.type === "extension_ui_request" && event.statusText === "anthropic via anthropic") {
+            child.stdin.write(`${JSON.stringify({ id: "state", type: "get_state" })}\n`);
+          } else if (event.id === "state") {
+            clearTimeout(timeout);
+            resolve(event);
+          }
+        } catch (error) {
+          clearTimeout(timeout);
+          reject(error);
+        }
+      });
+      child.once("error", reject);
+      child.once("exit", (code) => reject(new Error(`RPC exited ${code}: ${stderr}`)));
+      child.stdin.write(`${JSON.stringify({
+        id: "set",
+        type: "set_model",
+        provider: "multi-pass-anthropic",
+        modelId: "claude-sonnet-4-6",
+      })}\n`);
+    });
+
+    assert.equal(response?.data?.model?.provider, "anthropic");
+    assert.equal(response?.data?.model?.id, "claude-sonnet-4-6");
+  } finally {
+    lines.close();
+    if (child.exitCode === null) {
+      child.kill();
+      await once(child, "exit");
+    }
+    rmSync(agentDir, { recursive: true, force: true });
+  }
+}
+
 function runFailClosedCheck() {
   const result = withAgentConfig(
     setConfig({ id: "codex", baseProvider: "openai-codex", providerName: "openai-codex" }),
@@ -88,5 +161,6 @@ function runFailClosedCheck() {
 }
 
 runInitialSelectionCheck();
+await runInSessionSelectionCheck();
 runFailClosedCheck();
 console.log("logical provider checks passed");
