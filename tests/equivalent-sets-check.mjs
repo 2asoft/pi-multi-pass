@@ -31,7 +31,7 @@ function ensureSet(config, baseProvider) {
     id: defaultSetId(baseProvider),
     baseProvider,
     members: [{ providerName: baseProvider, enabled: true }],
-    autoSwitch: { enabled: true, strategy: "quota-first", cooldownMs: 300000 },
+    autoSwitch: { enabled: true, strategy: "quota-first", cooldownMs: 300000, buckets: [] },
   };
   config.sets.push(created);
   return created;
@@ -42,27 +42,6 @@ function addEquivalent(config, baseProvider, label) {
   const providerName = nextProviderName(set);
   set.members.push({ providerName, label, enabled: true });
   return providerName;
-}
-
-function chooseRoundRobin({ set, currentProvider, hasAuth, exhausted }) {
-  const members = set.members.filter((member) => member.enabled && hasAuth(member.providerName) && !exhausted.has(member.providerName));
-  if (members.length === 0) return undefined;
-  const currentIndex = members.findIndex((member) => member.providerName === currentProvider);
-  const start = currentIndex >= 0 ? currentIndex + 1 : 0;
-  for (let offset = 0; offset < members.length; offset += 1) {
-    const member = members[(start + offset) % members.length];
-    if (member.providerName !== currentProvider) return member.providerName;
-  }
-  return undefined;
-}
-
-function chooseQuotaFirst({ set, currentProvider, hasAuth, exhausted, quotaScores }) {
-  const candidates = set.members
-    .filter((member) => member.providerName !== currentProvider)
-    .filter((member) => member.enabled && hasAuth(member.providerName) && !exhausted.has(member.providerName))
-    .map((member) => ({ member, score: quotaScores.get(member.providerName) ?? 0 }))
-    .sort((left, right) => right.score - left.score || left.member.providerName.localeCompare(right.member.providerName));
-  return candidates[0]?.member.providerName;
 }
 
 function runAddEquivalentCheck() {
@@ -78,7 +57,7 @@ function runAddEquivalentCheck() {
         { providerName: "openai-codex-2", label: "work", enabled: true },
         { providerName: "openai-codex-3", label: "personal", enabled: true },
       ],
-      autoSwitch: { enabled: true, strategy: "quota-first", cooldownMs: 300000 },
+      autoSwitch: { enabled: true, strategy: "quota-first", cooldownMs: 300000, buckets: [] },
     }],
   });
 }
@@ -90,39 +69,6 @@ function runProviderParsingCheck() {
   assert.equal(getBaseProvider("unknown-2", supported), undefined);
 }
 
-function runRoundRobinCheck() {
-  const set = {
-    members: [
-      { providerName: "openai-codex", enabled: true },
-      { providerName: "openai-codex-2", enabled: true },
-      { providerName: "openai-codex-3", enabled: false },
-      { providerName: "openai-codex-4", enabled: true },
-    ],
-  };
-  const exhausted = new Set(["openai-codex-4"]);
-  assert.equal(chooseRoundRobin({ set, currentProvider: "openai-codex", exhausted, hasAuth: () => true }), "openai-codex-2");
-  assert.equal(chooseRoundRobin({ set, currentProvider: "openai-codex-2", exhausted, hasAuth: () => true }), "openai-codex");
-}
-
-function runQuotaFirstCheck() {
-  const set = {
-    members: [
-      { providerName: "openai-codex", enabled: true },
-      { providerName: "openai-codex-2", enabled: true },
-      { providerName: "openai-codex-3", enabled: true },
-    ],
-  };
-  assert.equal(chooseQuotaFirst({
-    set,
-    currentProvider: "openai-codex",
-    exhausted: new Set(),
-    hasAuth: () => true,
-    quotaScores: new Map([["openai-codex-2", 20], ["openai-codex-3", 80]]),
-  }), "openai-codex-3");
-}
-
 runAddEquivalentCheck();
 runProviderParsingCheck();
-runRoundRobinCheck();
-runQuotaFirstCheck();
 console.log("equivalent set checks passed");

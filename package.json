@@ -19,12 +19,12 @@
     "url": "https://github.com/2asoft/pi-multi-pass"
   },
   "scripts": {
-    "test": "node tests/equivalent-sets-check.mjs && node tests/subscription-limits-check.mjs && node tests/retry-signal-check.mjs && node tests/prime-subscription-check.mjs",
+    "test": "node tests/package-manifest-check.mjs && node tests/equivalent-sets-check.mjs && node tests/provider-buckets-check.mjs && node tests/subscription-limits-check.mjs && node tests/retry-signal-check.mjs && node tests/prime-subscription-check.mjs",
     "typecheck": "tsc"
   },
   "pi": {
     "extensions": [
-      "./extensions"
+      "./extensions/multi-sub.ts"
     ]
   },
   "peerDependencies": {

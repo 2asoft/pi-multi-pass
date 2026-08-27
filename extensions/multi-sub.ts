@@ -43,6 +43,15 @@ import {
 	matchesKey,
 	type SelectItem,
 } from "@earendil-works/pi-tui";
+import {
+	getBlockedQuotaRetryAt,
+	getFailureSuppressionUntil,
+	parseSelectionBuckets,
+	planQuotaFirstSelection,
+	selectEligibleBuckets,
+	type SelectionBucket,
+	type SelectionQuotaKind,
+} from "./provider-selection.js";
 
 // ==========================================================================
 // Provider templates
@@ -68,7 +77,7 @@ const DEFAULT_CODEX_USAGE_BASE_URL = "https://chatgpt.com/backend-api";
 const OPENAI_AUTH_CLAIM = "https://api.openai.com/auth";
 const OPENAI_PROFILE_CLAIM = "https://api.openai.com/profile";
 
-type QuotaStatusKind = "ready" | "watch" | "low" | "blocked" | "error" | "missing-auth";
+type QuotaStatusKind = SelectionQuotaKind;
 
 interface AuthStorageEntry {
 	type?: string;
@@ -93,6 +102,7 @@ interface QuotaCheckResult {
 	summary: string;
 	details: string[];
 	score: number;
+	retryAt?: number;
 }
 
 interface ProviderQuotaChecker {
@@ -198,6 +208,17 @@ function parseCodexUsageSnapshot(data: unknown): CodexUsageSnapshot {
 function getCodexWindowRemaining(window: CodexUsageWindow | undefined): number | undefined {
 	if (!window) return undefined;
 	return Math.max(0, Math.min(100, 100 - window.usedPercent));
+}
+
+function getCodexRetryAt(snapshot: CodexUsageSnapshot): number | undefined {
+	return getBlockedQuotaRetryAt(
+		[snapshot.fiveHour, snapshot.weekly, snapshot.primary]
+			.filter((window): window is CodexUsageWindow => window !== undefined)
+			.map((window) => ({
+				remaining: getCodexWindowRemaining(window),
+				resetAtSeconds: window.resetAt,
+			})),
+	);
 }
 
 function formatResetShort(resetAt?: number): string {
@@ -568,6 +589,7 @@ const codexQuotaChecker: ProviderQuotaChecker = {
 				summary,
 				details,
 				score: classification.score,
+				retryAt: classification.kind === "blocked" ? getCodexRetryAt(snapshot) : undefined,
 			};
 		} catch (error: unknown) {
 			if (signal?.aborted || isAbortError(error)) throw error;
@@ -623,6 +645,7 @@ interface AutoSwitchPolicy {
 	enabled: boolean;
 	strategy: AutoSwitchStrategy;
 	cooldownMs: number;
+	buckets: SelectionBucket[];
 }
 
 interface EquivalentSet {
@@ -659,7 +682,10 @@ function defaultSetId(baseProvider: string): string {
 		.toLowerCase();
 }
 
-function normalizeAutoSwitchPolicy(value: unknown): AutoSwitchPolicy {
+function normalizeAutoSwitchPolicy(
+	value: unknown,
+	validProviderNames: ReadonlySet<string>,
+): AutoSwitchPolicy {
 	const raw = getRecord(value);
 	const strategy = raw?.strategy === "round-robin" || raw?.strategy === "manual" || raw?.strategy === "quota-first"
 		? raw.strategy
@@ -671,6 +697,7 @@ function normalizeAutoSwitchPolicy(value: unknown): AutoSwitchPolicy {
 		enabled: typeof raw?.enabled === "boolean" ? raw.enabled : true,
 		strategy,
 		cooldownMs,
+		buckets: parseSelectionBuckets(raw?.buckets, validProviderNames),
 	};
 }
 
@@ -706,7 +733,10 @@ function normalizeSet(value: unknown): EquivalentSet | undefined {
 		id: typeof raw.id === "string" && raw.id.trim().length > 0 ? raw.id.trim() : defaultSetId(baseProvider),
 		baseProvider,
 		members: uniqueMembers,
-		autoSwitch: normalizeAutoSwitchPolicy(raw.autoSwitch),
+		autoSwitch: normalizeAutoSwitchPolicy(
+			raw.autoSwitch,
+			new Set(uniqueMembers.map((member) => member.providerName)),
+		),
 	};
 }
 
@@ -767,7 +797,12 @@ function ensureSet(config: MultiPassConfig, baseProvider: string): EquivalentSet
 		id: defaultSetId(baseProvider),
 		baseProvider,
 		members: [{ providerName: baseProvider, enabled: true }],
-		autoSwitch: { enabled: true, strategy: "quota-first", cooldownMs: DEFAULT_COOLDOWN_MS },
+		autoSwitch: {
+			enabled: true,
+			strategy: "quota-first",
+			cooldownMs: DEFAULT_COOLDOWN_MS,
+			buckets: [],
+		},
 	};
 	config.sets.push(created);
 	return created;
@@ -785,9 +820,23 @@ function memberDisplayName(member: EquivalentMember, set?: EquivalentSet): strin
 	return `${label}${template?.displayName || baseProvider} (${nativeSuffix})`;
 }
 
+function bucketForProvider(set: EquivalentSet, providerName: string): SelectionBucket | undefined {
+	return set.autoSwitch.buckets.find((bucket) => bucket.members.includes(providerName));
+}
+
+function removeProviderFromBuckets(set: EquivalentSet, providerName: string): void {
+	set.autoSwitch.buckets = set.autoSwitch.buckets
+		.map((bucket) => ({
+			...bucket,
+			members: bucket.members.filter((candidate) => candidate !== providerName),
+		}))
+		.filter((bucket) => bucket.members.length > 0);
+}
+
 function formatMemberLine(member: EquivalentMember, set: EquivalentSet, authStorage: { hasAuth(provider: string): boolean }): string {
 	const auth = authStorage.hasAuth(member.providerName) ? "logged in" : "not logged in";
-	const auto = member.enabled ? "auto" : "manual only";
+	const bucket = bucketForProvider(set, member.providerName);
+	const auto = bucket ? `bucket ${bucket.id}${member.enabled ? "" : " (disabled)"}` : "manual only";
 	return `${member.providerName} -- ${memberDisplayName(member, set)} | ${auto} | ${auth}`;
 }
 
@@ -967,8 +1016,10 @@ class EquivalentSetRuntime {
 
 	constructor(private readonly pi: ExtensionAPI) {}
 
-	markExhausted(providerName: string, cooldownMs: number): void {
-		this.memberState.set(providerName, { exhaustedUntil: Date.now() + cooldownMs });
+	markExhausted(providerName: string, cooldownMs: number, retryAt?: number): void {
+		this.memberState.set(providerName, {
+			exhaustedUntil: getFailureSuppressionUntil(Date.now(), cooldownMs, retryAt),
+		});
 	}
 
 	isExhausted(providerName: string): boolean {
@@ -981,32 +1032,47 @@ class EquivalentSetRuntime {
 		return true;
 	}
 
-	availableMembers(set: EquivalentSet, authStorage: { hasAuth(provider: string): boolean }): EquivalentMember[] {
-		return set.members.filter((member) =>
-			member.enabled && authStorage.hasAuth(member.providerName) && !this.isExhausted(member.providerName),
-		);
+	private eligibleBuckets(
+		set: EquivalentSet,
+		currentModel: Model<Api>,
+		ctx: ExtensionContext,
+	): Array<{ id: string; members: EquivalentMember[] }> {
+		const membersByProvider = new Map(set.members.map((member) => [member.providerName, member]));
+		const eligibleProviderNames = new Set(set.members
+			.filter((member) =>
+				member.enabled
+				&& member.providerName !== currentModel.provider
+				&& ctx.modelRegistry.hasAuth(member.providerName)
+				&& !this.isExhausted(member.providerName)
+				&& ctx.modelRegistry.find(member.providerName, currentModel.id) !== undefined,
+			)
+			.map((member) => member.providerName));
+		return selectEligibleBuckets(set.autoSwitch.buckets, eligibleProviderNames).map((bucket) => ({
+			id: bucket.id,
+			members: bucket.members
+				.map((providerName) => membersByProvider.get(providerName))
+				.filter((member): member is EquivalentMember => member !== undefined),
+		}));
 	}
 
-	private chooseRoundRobin(set: EquivalentSet, currentProvider: string, authStorage: { hasAuth(provider: string): boolean }): EquivalentMember | undefined {
-		const members = this.availableMembers(set, authStorage).filter((member) => member.providerName !== currentProvider);
+	private chooseRoundRobin(
+		set: EquivalentSet,
+		bucketId: string,
+		members: EquivalentMember[],
+	): EquivalentMember | undefined {
 		if (members.length === 0) return undefined;
-		const cursor = this.roundRobinIndex.get(set.id) || 0;
-		for (let offset = 0; offset < members.length; offset++) {
-			const member = members[(cursor + offset) % members.length];
-			this.roundRobinIndex.set(set.id, (cursor + offset + 1) % members.length);
-			return member;
-		}
-		return undefined;
+		const cursorKey = `${set.id}:${bucketId}`;
+		const cursor = this.roundRobinIndex.get(cursorKey) || 0;
+		const member = members[cursor % members.length];
+		this.roundRobinIndex.set(cursorKey, (cursor + 1) % members.length);
+		return member;
 	}
 
 	private async chooseQuotaFirst(
 		set: EquivalentSet,
-		currentProvider: string,
-		ctx: ExtensionContext,
+		buckets: Array<{ id: string; members: EquivalentMember[] }>,
 	): Promise<EquivalentMember | undefined> {
-		const candidates = this.availableMembers(set, ctx.modelRegistry)
-			.filter((member) => member.providerName !== currentProvider);
-		if (candidates.length === 0) return undefined;
+		const candidates = buckets.flatMap((bucket) => bucket.members);
 		const accounts = candidates.map((member) => ({
 			providerName: member.providerName,
 			baseProvider: set.baseProvider,
@@ -1014,19 +1080,54 @@ class EquivalentSetRuntime {
 			auth: readStoredCredential(member.providerName) as AuthStorageEntry | undefined,
 		}));
 		const results = await runQuotaChecks(accounts);
-		const bestReady = results.find((result) => result.kind !== "error" && result.kind !== "missing-auth");
-		if (bestReady) {
-			return candidates.find((member) => member.providerName === bestReady.account.providerName);
+		const plan = planQuotaFirstSelection(
+			buckets.map((bucket) => ({
+				id: bucket.id,
+				members: bucket.members.map((member) => member.providerName),
+			})),
+			new Map(results.map((result) => [result.account.providerName, result])),
+		);
+		if (plan.kind === "unavailable") return undefined;
+		if (plan.kind === "selected") {
+			return candidates.find((member) => member.providerName === plan.providerName);
 		}
-		return this.chooseRoundRobin(set, currentProvider, ctx.modelRegistry);
+		const memberNames = new Set(plan.providerNames);
+		const bucket = buckets.find((candidate) => candidate.id === plan.bucketId);
+		return bucket
+			? this.chooseRoundRobin(set, bucket.id, bucket.members.filter((member) => memberNames.has(member.providerName)))
+			: undefined;
 	}
 
-	private async chooseNext(set: EquivalentSet, currentProvider: string, ctx: ExtensionContext): Promise<EquivalentMember | undefined> {
+	private async chooseNext(
+		set: EquivalentSet,
+		currentModel: Model<Api>,
+		ctx: ExtensionContext,
+	): Promise<EquivalentMember | undefined> {
 		if (set.autoSwitch.strategy === "manual") return undefined;
+		const buckets = this.eligibleBuckets(set, currentModel, ctx);
+		if (buckets.length === 0) return undefined;
 		if (set.autoSwitch.strategy === "quota-first") {
-			return this.chooseQuotaFirst(set, currentProvider, ctx);
+			return this.chooseQuotaFirst(set, buckets);
 		}
-		return this.chooseRoundRobin(set, currentProvider, ctx.modelRegistry);
+		return this.chooseRoundRobin(set, buckets[0].id, buckets[0].members);
+	}
+
+	private async markCurrentProviderExhausted(
+		set: EquivalentSet,
+		currentProvider: string,
+	): Promise<void> {
+		const member = set.members.find((candidate) => candidate.providerName === currentProvider);
+		if (!member || !PROVIDER_QUOTA_CHECKERS.some((checker) => checker.baseProvider === set.baseProvider)) {
+			this.markExhausted(currentProvider, set.autoSwitch.cooldownMs);
+			return;
+		}
+		const [result] = await runQuotaChecks([{
+			providerName: member.providerName,
+			baseProvider: set.baseProvider,
+			displayName: memberDisplayName(member, set),
+			auth: readStoredCredential(member.providerName) as AuthStorageEntry | undefined,
+		}]);
+		this.markExhausted(currentProvider, set.autoSwitch.cooldownMs, result?.retryAt);
 	}
 
 	async handleRateLimit(errorMessage: string, currentModel: Model<Api> | undefined, ctx: ExtensionContext): Promise<boolean> {
@@ -1035,10 +1136,10 @@ class EquivalentSetRuntime {
 		const set = findSetForProvider(config, currentModel.provider);
 		if (!set || !set.autoSwitch.enabled) return false;
 
-		this.markExhausted(currentModel.provider, set.autoSwitch.cooldownMs);
-		const next = await this.chooseNext(set, currentModel.provider, ctx);
+		await this.markCurrentProviderExhausted(set, currentModel.provider);
+		const next = await this.chooseNext(set, currentModel, ctx);
 		if (!next) {
-			ctx.ui.notify(`[subs:${set.id}] no enabled authenticated equivalent account available for auto-switch`, "warning");
+			ctx.ui.notify(`[subs:${set.id}] no available provider in the auto-switch buckets`, "warning");
 			ctx.ui.setStatus("multi-pass", `${set.id}: exhausted`);
 			return false;
 		}
@@ -1094,7 +1195,6 @@ async function handleSubsAdd(pi: ExtensionAPI, ctx: ExtensionCommandContext, req
 	const member: EquivalentMember = { providerName, enabled: true };
 	if (label?.trim()) member.label = label.trim();
 	set.members.push(member);
-	set.autoSwitch.enabled = true;
 	if (!set.autoSwitch.strategy) set.autoSwitch.strategy = "quota-first";
 	saveGlobalConfig(config);
 	registerEquivalentProvider(pi, providerName);
@@ -1132,13 +1232,16 @@ async function buildDashboardState(ctx: ExtensionCommandContext): Promise<Dashbo
 
 function formatDashboardSetDescription(set: EquivalentSet, states: DashboardMemberState[]): string {
 	const authed = states.filter((state) => state.authed).length;
-	const auto = states.filter((state) => state.member.enabled).length;
-	return `auto-switch ${set.autoSwitch.enabled ? "on" : "off"} | ${set.autoSwitch.strategy} | ${auto}/${states.length} auto | ${authed}/${states.length} logged in`;
+	const auto = states.filter((state) =>
+		state.member.enabled && bucketForProvider(set, state.member.providerName) !== undefined,
+	).length;
+	return `auto-switch ${set.autoSwitch.enabled ? "on" : "off"} | ${set.autoSwitch.strategy} | ${set.autoSwitch.buckets.length} buckets | ${auto}/${states.length} auto | ${authed}/${states.length} logged in`;
 }
 
 function formatDashboardMemberDescription(state: DashboardMemberState): string {
+	const bucket = bucketForProvider(state.set, state.member.providerName);
 	const parts = [
-		state.member.enabled ? "auto" : "manual",
+		bucket ? `bucket ${bucket.id}${state.member.enabled ? "" : " (disabled)"}` : "manual only",
 		state.authed ? "logged in" : "not logged in",
 	];
 	if (state.current) parts.push("current");
@@ -1158,9 +1261,11 @@ function dashboardItems(state: DashboardState): SelectItem[] {
 			description: formatDashboardSetDescription(set, states),
 		});
 		for (const memberState of states) {
+			const bucket = bucketForProvider(set, memberState.member.providerName);
+			const placement = bucket ? `[${bucket.id}${memberState.member.enabled ? "" : ":off"}]` : "[manual]";
 			items.push({
 				value: `member:${memberState.member.providerName}`,
-				label: `  ${memberState.member.enabled ? "[auto]" : "[manual]"} ${memberState.member.providerName}`,
+				label: `  ${placement} ${memberState.member.providerName}`,
 				description: formatDashboardMemberDescription(memberState),
 			});
 		}
@@ -1182,17 +1287,104 @@ async function switchToProvider(pi: ExtensionAPI, ctx: ExtensionCommandContext, 
 	ctx.ui.notify(success ? `Switched to ${providerName}/${model.id}.` : `Failed to switch to ${providerName}.`, success ? "info" : "warning");
 }
 
+async function addSelectionBucket(
+	ctx: ExtensionCommandContext,
+	set: EquivalentSet,
+	providerName?: string,
+): Promise<string | undefined> {
+	let initialProvider = providerName;
+	if (!initialProvider) {
+		const assigned = new Set(set.autoSwitch.buckets.flatMap((bucket) => bucket.members));
+		const unassigned = set.members.filter((member) => !assigned.has(member.providerName));
+		if (unassigned.length === 0) {
+			ctx.ui.notify("Every provider is already assigned to a bucket.", "info");
+			return undefined;
+		}
+		initialProvider = await showWrappedSelect(ctx, {
+			title: "Add Selection Bucket",
+			subtitle: "Select the first provider for this bucket.",
+			items: unassigned.map((member) => ({
+				value: member.providerName,
+				label: member.providerName,
+				description: memberDisplayName(member, set),
+			})),
+			confirmHint: "select",
+			cancelHint: "cancel",
+		});
+	}
+	if (!initialProvider) return undefined;
+
+	const requestedId = await ctx.ui.input("Bucket name", "for example: plus or pro");
+	const id = requestedId?.trim();
+	if (!id) return undefined;
+	if (set.autoSwitch.buckets.some((bucket) => bucket.id === id)) {
+		ctx.ui.notify(`Bucket ${id} already exists.`, "warning");
+		return undefined;
+	}
+	removeProviderFromBuckets(set, initialProvider);
+	set.autoSwitch.buckets.push({ id, members: [initialProvider] });
+	return id;
+}
+
+async function handleSelectionBucketActions(
+	ctx: ExtensionCommandContext,
+	config: MultiPassConfig,
+	set: EquivalentSet,
+	bucketId: string,
+): Promise<void> {
+	const index = set.autoSwitch.buckets.findIndex((bucket) => bucket.id === bucketId);
+	if (index < 0) return;
+	const bucket = set.autoSwitch.buckets[index];
+	const action = await showWrappedSelect(ctx, {
+		title: `Bucket: ${bucket.id}`,
+		subtitle: bucket.members.join(", "),
+		items: [
+			{ value: "move-up", label: "move earlier", description: "Increase selection priority" },
+			{ value: "move-down", label: "move later", description: "Decrease selection priority" },
+			{ value: "rename", label: "rename bucket", description: "Change the bucket name" },
+			{ value: "remove", label: "remove bucket", description: "Leave its providers outside all buckets" },
+		],
+		confirmHint: "apply",
+		cancelHint: "back",
+	});
+	if (!action) return;
+	if (action === "move-up" && index > 0) {
+		[set.autoSwitch.buckets[index - 1], set.autoSwitch.buckets[index]] = [bucket, set.autoSwitch.buckets[index - 1]];
+	} else if (action === "move-down" && index < set.autoSwitch.buckets.length - 1) {
+		[set.autoSwitch.buckets[index], set.autoSwitch.buckets[index + 1]] = [set.autoSwitch.buckets[index + 1], bucket];
+	} else if (action === "rename") {
+		const requestedId = await ctx.ui.input("Bucket name", bucket.id);
+		const id = requestedId?.trim();
+		if (!id) return;
+		if (set.autoSwitch.buckets.some((candidate) => candidate !== bucket && candidate.id === id)) {
+			ctx.ui.notify(`Bucket ${id} already exists.`, "warning");
+			return;
+		}
+		bucket.id = id;
+	} else if (action === "remove") {
+		set.autoSwitch.buckets.splice(index, 1);
+	}
+	saveGlobalConfig(config);
+}
+
 async function handleDashboardSetActions(ctx: ExtensionCommandContext, config: MultiPassConfig, set: EquivalentSet): Promise<void> {
 	while (true) {
+		const items: SelectItem[] = [
+			{ value: "toggle-auto", label: "toggle auto-switch", description: `currently ${set.autoSwitch.enabled ? "on" : "off"}` },
+			{ value: "strategy-quota-first", label: "strategy: quota-first", description: "prefer quota within the first usable bucket" },
+			{ value: "strategy-round-robin", label: "strategy: round-robin", description: "rotate within the first eligible bucket" },
+			{ value: "strategy-manual", label: "strategy: manual", description: "do not auto-switch" },
+			{ value: "action:add-bucket", label: "add bucket", description: "Append the lowest-priority selection bucket" },
+			...set.autoSwitch.buckets.map((bucket, index) => ({
+				value: `bucket:${bucket.id}`,
+				label: `${index + 1}. ${bucket.id}`,
+				description: bucket.members.join(", "),
+			})),
+		];
 		const action = await showWrappedSelect(ctx, {
 			title: `Set: ${set.id}`,
 			subtitle: formatDashboardSetDescription(set, set.members.map((member) => ({ set, member, authed: ctx.modelRegistry.hasAuth(member.providerName), current: ctx.model?.provider === member.providerName }))),
-			items: [
-				{ value: "toggle-auto", label: "toggle auto-switch", description: `currently ${set.autoSwitch.enabled ? "on" : "off"}` },
-				{ value: "strategy-quota-first", label: "strategy: quota-first", description: "prefer account with most quota" },
-				{ value: "strategy-round-robin", label: "strategy: round-robin", description: "rotate through auto accounts" },
-				{ value: "strategy-manual", label: "strategy: manual", description: "do not auto-switch" },
-			],
+			items,
 			confirmHint: "apply",
 			cancelHint: "back",
 		});
@@ -1201,6 +1393,11 @@ async function handleDashboardSetActions(ctx: ExtensionCommandContext, config: M
 		else if (action === "strategy-quota-first") set.autoSwitch.strategy = "quota-first";
 		else if (action === "strategy-round-robin") set.autoSwitch.strategy = "round-robin";
 		else if (action === "strategy-manual") set.autoSwitch.strategy = "manual";
+		else if (action === "action:add-bucket") await addSelectionBucket(ctx, set);
+		else if (action.startsWith("bucket:")) {
+			await handleSelectionBucketActions(ctx, config, set, action.slice("bucket:".length));
+			continue;
+		}
 		saveGlobalConfig(config);
 	}
 }
@@ -1212,12 +1409,20 @@ async function handleDashboardMemberActions(
 	state: DashboardMemberState,
 ): Promise<void> {
 	const { set, member, quota } = state;
+	const currentBucket = bucketForProvider(set, member.providerName);
 	const actions: SelectItem[] = [
 		{ value: "switch", label: "switch now", description: "Use this account for the current model" },
-		{ value: "toggle-auto", label: member.enabled ? "make manual only" : "enable for auto-switch", description: "Toggle whether rate-limit failover may select this account" },
+		{ value: "assign-bucket", label: "selection bucket", description: currentBucket ? `currently ${currentBucket.id}` : "currently outside all buckets" },
 		{ value: "login", label: "login instructions", description: `Select ${loginInstructionForMember(set, member)} from /login` },
 		{ value: "logout", label: "logout", description: state.authed ? "Clear saved auth for this account" : "Not logged in" },
 	];
+	if (currentBucket) {
+		actions.splice(2, 0, {
+			value: "toggle-auto",
+			label: member.enabled ? "disable automatic selection" : "enable automatic selection",
+			description: `Apply within bucket ${currentBucket.id}`,
+		});
+	}
 	if (state.authed) {
 		actions.push({
 			value: "prime",
@@ -1237,10 +1442,39 @@ async function handleDashboardMemberActions(
 	});
 	if (!action) return;
 	if (action === "switch") return switchToProvider(pi, ctx, member.providerName);
+	if (action === "assign-bucket") {
+		const selected = await showWrappedSelect(ctx, {
+			title: `Selection Bucket: ${member.providerName}`,
+			items: [
+				{ value: "outside", label: "outside all buckets", description: "Manual switching only" },
+				...set.autoSwitch.buckets.map((bucket, index) => ({
+					value: `bucket:${bucket.id}`,
+					label: `${index + 1}. ${bucket.id}`,
+					description: bucket.members.join(", "),
+				})),
+				{ value: "new", label: "new bucket", description: "Append a lowest-priority bucket" },
+			],
+			initialValue: currentBucket ? `bucket:${currentBucket.id}` : "outside",
+			confirmHint: "assign",
+			cancelHint: "cancel",
+		});
+		if (!selected) return;
+		if (selected === "new") {
+			if (!await addSelectionBucket(ctx, set, member.providerName)) return;
+		} else {
+			removeProviderFromBuckets(set, member.providerName);
+			if (selected.startsWith("bucket:")) {
+				const bucket = set.autoSwitch.buckets.find((candidate) => candidate.id === selected.slice("bucket:".length));
+				bucket?.members.push(member.providerName);
+			}
+		}
+		saveGlobalConfig(config);
+		return;
+	}
 	if (action === "toggle-auto") {
 		member.enabled = !member.enabled;
 		saveGlobalConfig(config);
-		ctx.ui.notify(`${member.providerName} is now ${member.enabled ? "enabled for auto-switch" : "manual only"}.`, "info");
+		ctx.ui.notify(`${member.providerName} is now ${member.enabled ? "enabled" : "disabled"} within its selection bucket.`, "info");
 		return;
 	}
 	if (action === "login") {
@@ -1258,6 +1492,7 @@ async function handleDashboardMemberActions(
 		const confirmed = await ctx.ui.confirm("Remove account", `Remove ${member.providerName}? Auth for this account will also be cleared.`);
 		if (!confirmed) return;
 		set.members = set.members.filter((candidate) => candidate.providerName !== member.providerName);
+		removeProviderFromBuckets(set, member.providerName);
 		await ctx.modelRegistry.logout(member.providerName);
 		pi.unregisterProvider(member.providerName);
 		saveGlobalConfig(config);
@@ -1347,6 +1582,7 @@ async function handleSubsRemove(pi: ExtensionAPI, ctx: ExtensionCommandContext):
 	const confirmed = await ctx.ui.confirm("Remove account", `Remove ${selected.member.providerName}? Auth for this account will also be cleared.`);
 	if (!confirmed) return;
 	selected.set.members = selected.set.members.filter((member) => member.providerName !== selected.member.providerName);
+	removeProviderFromBuckets(selected.set, selected.member.providerName);
 	await ctx.modelRegistry.logout(selected.member.providerName);
 	pi.unregisterProvider(selected.member.providerName);
 	saveGlobalConfig(selected.config);
