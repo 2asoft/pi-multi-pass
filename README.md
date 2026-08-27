@@ -47,6 +47,22 @@ When the active account returns a quota-exhaustion runtime error, multi-pass can
 
 The dashboard always refreshes quota and combines status, limits, bucket placement, and auto-switch settings. Select a set to change its policy, strategy, or bucket order. Select an account to switch, assign a bucket, enable or disable selection within its bucket, prime the subscription, view quota details, login/logout, or remove it.
 
+## CLI automatic selection
+
+Each configured set exposes a logical provider named `multi-pass-<set-id>`. Use it to select a concrete account from the configured buckets before Pi sends its first request:
+
+```bash
+pi --model multi-pass-codex/gpt-5.6-sol
+```
+
+The logical provider preserves the requested model ID. The extension applies the set's normal strategy, switches to the selected concrete provider during `session_start`, and continues to use the same rules for later quota failover. Choosing a concrete provider bypasses initial selection:
+
+```bash
+pi --model openai-codex-8/gpt-5.6-sol
+```
+
+A logical provider has no user credential or login flow and cannot send an upstream model request. If automatic selection is disabled or no bucket has an available provider for the requested model, it returns a local routing error instead of using an unbucketed account.
+
 ## Prime subscription
 
 Some providers only start a rolling quota window after the first real model request. Use `/subs prime` or the dashboard **prime subscription** action to send the smallest practical completion for a logged-in account. multi-pass keeps the current session model unchanged, prefers the current model id when that account can serve it, otherwise picks the cheapest available model, and refreshes quota details afterward when a checker exists.
@@ -98,13 +114,13 @@ Config is global and stored at `~/.pi/agent/multi-pass.json`.
 
 Fields:
 
-- `id`: display name for the equivalent set.
+- `id`: set identifier and source of the `multi-pass-<set-id>` logical provider name. Values must remain unique after lowercase slug normalization; normalization keeps the first colliding set.
 - `baseProvider`: provider being cloned, such as `openai-codex`.
 - `members[].providerName`: concrete provider name. Native account is the base provider; extra accounts use `baseProvider-N`.
 - `members[].enabled`: whether this account may be selected while it is assigned to a bucket.
 - `members[].label`: optional display label.
-- `autoSwitch.enabled`: whether runtime failover is active for the set.
-- `autoSwitch.strategy`: `quota-first`, `round-robin`, or `manual`.
+- `autoSwitch.enabled`: whether initial automatic selection and runtime failover are active for the set.
+- `autoSwitch.strategy`: `quota-first`, `round-robin`, or `manual`. The `manual` strategy also disables initial logical-provider selection.
 - `autoSwitch.cooldownMs`: fallback suppression time after an account rate-limits and no quota reset time is available.
 - `autoSwitch.buckets`: selection buckets in highest-to-lowest priority order.
 - `autoSwitch.buckets[].id`: user-managed bucket name.

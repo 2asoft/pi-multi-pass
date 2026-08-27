@@ -15,6 +15,24 @@ export type QuotaSelectionPlan =
 	| { kind: "round-robin"; bucketId: string; providerNames: string[] }
 	| { kind: "unavailable" };
 
+export function selectionProviderName(setId: string): string {
+	const slug = setId
+		.replace(/[^a-z0-9]+/gi, "-")
+		.replace(/^-+|-+$/g, "")
+		.toLowerCase();
+	return `multi-pass-${slug || "set"}`;
+}
+
+export function deduplicateSelectionSets<T extends { id: string }>(sets: T[]): T[] {
+	const providerNames = new Set<string>();
+	return sets.filter((set) => {
+		const providerName = selectionProviderName(set.id);
+		if (providerNames.has(providerName)) return false;
+		providerNames.add(providerName);
+		return true;
+	});
+}
+
 function getRecord(value: unknown): Record<string, unknown> | undefined {
 	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
 	return value as Record<string, unknown>;

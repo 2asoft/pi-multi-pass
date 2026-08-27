@@ -1,12 +1,27 @@
 import assert from "node:assert/strict";
 
 import {
+  deduplicateSelectionSets,
   getBlockedQuotaRetryAt,
   getFailureSuppressionUntil,
   parseSelectionBuckets,
   planQuotaFirstSelection,
   selectEligibleBuckets,
+  selectionProviderName,
 } from "../extensions/provider-selection.ts";
+
+function runSelectionProviderNameChecks() {
+  assert.equal(selectionProviderName("codex"), "multi-pass-codex");
+  assert.equal(selectionProviderName("Main Pool"), "multi-pass-main-pool");
+  assert.deepEqual(deduplicateSelectionSets([
+    { id: "Main Pool", value: 1 },
+    { id: "main-pool", value: 2 },
+    { id: "reserve", value: 3 },
+  ]), [
+    { id: "Main Pool", value: 1 },
+    { id: "reserve", value: 3 },
+  ]);
+}
 
 function runBucketParsingChecks() {
   const buckets = parseSelectionBuckets([
@@ -108,6 +123,7 @@ function runQuotaSelectionChecks() {
   });
 }
 
+runSelectionProviderNameChecks();
 runBucketParsingChecks();
 runEligibilityChecks();
 runFailureSuppressionChecks();

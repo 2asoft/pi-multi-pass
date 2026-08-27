@@ -34,7 +34,15 @@ import {
 	keyHint,
 	readStoredCredential,
 } from "@earendil-works/pi-coding-agent";
-import type { Api, Model } from "@earendil-works/pi-ai";
+import {
+	createAssistantMessageEventStream,
+	type Api,
+	type AssistantMessage,
+	type AssistantMessageEventStream,
+	type Model,
+	type Provider,
+} from "@earendil-works/pi-ai";
+import { getBuiltinModels } from "@earendil-works/pi-ai/providers/all";
 import {
 	Container,
 	Key,
@@ -44,11 +52,13 @@ import {
 	type SelectItem,
 } from "@earendil-works/pi-tui";
 import {
+	deduplicateSelectionSets,
 	getBlockedQuotaRetryAt,
 	getFailureSuppressionUntil,
 	parseSelectionBuckets,
 	planQuotaFirstSelection,
 	selectEligibleBuckets,
+	selectionProviderName,
 	type SelectionBucket,
 	type SelectionQuotaKind,
 } from "./provider-selection.js";
@@ -742,9 +752,11 @@ function normalizeSet(value: unknown): EquivalentSet | undefined {
 
 function normalizeMultiPassConfig(raw: unknown): MultiPassConfig {
 	const record = getRecord(raw);
-	const sets = (Array.isArray(record?.sets) ? record.sets : [])
-		.map(normalizeSet)
-		.filter((set): set is EquivalentSet => Boolean(set));
+	const sets = deduplicateSelectionSets(
+		(Array.isArray(record?.sets) ? record.sets : [])
+			.map(normalizeSet)
+			.filter((set): set is EquivalentSet => Boolean(set)),
+	);
 	return { sets };
 }
 
@@ -859,7 +871,77 @@ function registerEquivalentProvider(pi: ExtensionAPI, providerName: string): voi
 	});
 }
 
+function selectionProviderModels(baseProvider: string, providerName: string): Model<Api>[] {
+	const models = (() => {
+		switch (baseProvider) {
+			case "anthropic":
+				return getBuiltinModels("anthropic");
+			case "openai-codex":
+				return getBuiltinModels("openai-codex");
+			case "github-copilot":
+				return getBuiltinModels("github-copilot");
+			default:
+				return [];
+		}
+	})();
+	return models.map((model) => ({
+		...model,
+		provider: providerName,
+		baseUrl: "http://127.0.0.1",
+	}));
+}
+
+function selectionProviderErrorStream(model: Model<Api>): AssistantMessageEventStream {
+	const stream = createAssistantMessageEventStream();
+	queueMicrotask(() => {
+		const error: AssistantMessage = {
+			role: "assistant",
+			content: [],
+			api: model.api,
+			provider: model.provider,
+			model: model.id,
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "error",
+			errorMessage: `Multi-pass could not route ${model.provider}/${model.id} to an available provider.`,
+			timestamp: Date.now(),
+		};
+		stream.push({ type: "error", reason: "error", error });
+	});
+	return stream;
+}
+
+function createSelectionProvider(set: EquivalentSet): Provider {
+	const providerName = selectionProviderName(set.id);
+	return {
+		id: providerName,
+		name: `Multi-pass selector: ${set.id}`,
+		baseUrl: "http://127.0.0.1",
+		auth: {
+			apiKey: {
+				name: `Multi-pass selector: ${set.id}`,
+				resolve: async () => ({
+					auth: { apiKey: "unused-selector-key" },
+					source: "multi-pass selector",
+				}),
+			},
+		},
+		getModels: () => selectionProviderModels(set.baseProvider, providerName),
+		stream: selectionProviderErrorStream,
+		streamSimple: selectionProviderErrorStream,
+	};
+}
+
 function registerConfiguredProviders(pi: ExtensionAPI, config: MultiPassConfig): void {
+	for (const set of config.sets) {
+		pi.registerProvider(createSelectionProvider(set));
+	}
 	for (const { member } of allMembers(config)) {
 		registerEquivalentProvider(pi, member.providerName);
 	}
@@ -1039,13 +1121,14 @@ class EquivalentSetRuntime {
 	): Array<{ id: string; members: EquivalentMember[] }> {
 		const membersByProvider = new Map(set.members.map((member) => [member.providerName, member]));
 		const eligibleProviderNames = new Set(set.members
-			.filter((member) =>
-				member.enabled
-				&& member.providerName !== currentModel.provider
-				&& ctx.modelRegistry.hasAuth(member.providerName)
-				&& !this.isExhausted(member.providerName)
-				&& ctx.modelRegistry.find(member.providerName, currentModel.id) !== undefined,
-			)
+			.filter((member) => {
+				const model = ctx.modelRegistry.find(member.providerName, currentModel.id);
+				return member.enabled
+					&& member.providerName !== currentModel.provider
+					&& model !== undefined
+					&& ctx.modelRegistry.hasConfiguredAuth(model)
+					&& !this.isExhausted(member.providerName);
+			})
 			.map((member) => member.providerName));
 		return selectEligibleBuckets(set.autoSwitch.buckets, eligibleProviderNames).map((bucket) => ({
 			id: bucket.id,
@@ -1110,6 +1193,43 @@ class EquivalentSetRuntime {
 			return this.chooseQuotaFirst(set, buckets);
 		}
 		return this.chooseRoundRobin(set, buckets[0].id, buckets[0].members);
+	}
+
+	async handleInitialSelection(
+		currentModel: Model<Api> | undefined,
+		ctx: ExtensionContext,
+	): Promise<"not-requested" | "selected" | "unavailable"> {
+		if (!currentModel) return "not-requested";
+		const config = loadGlobalConfig();
+		const set = config.sets.find((candidate) =>
+			selectionProviderName(candidate.id) === currentModel.provider,
+		);
+		if (!set) return "not-requested";
+		if (!set.autoSwitch.enabled) {
+			ctx.ui.notify(`[subs:${set.id}] automatic selection is disabled`, "warning");
+			ctx.ui.setStatus("multi-pass", `${set.id}: disabled`);
+			return "unavailable";
+		}
+
+		const next = await this.chooseNext(set, currentModel, ctx);
+		if (!next) {
+			ctx.ui.notify(
+				`[subs:${set.id}] no available provider can serve ${currentModel.id}`,
+				"warning",
+			);
+			ctx.ui.setStatus("multi-pass", `${set.id}: unavailable`);
+			return "unavailable";
+		}
+		const nextModel = ctx.modelRegistry.find(next.providerName, currentModel.id);
+		if (!nextModel || !await this.pi.setModel(nextModel)) {
+			ctx.ui.notify(`[subs:${set.id}] failed to select ${next.providerName}`, "warning");
+			ctx.ui.setStatus("multi-pass", `${set.id}: unavailable`);
+			return "unavailable";
+		}
+
+		ctx.ui.notify(`[subs:${set.id}] selected ${next.providerName}`, "info");
+		ctx.ui.setStatus("multi-pass", `${set.id} via ${next.providerName}`);
+		return "selected";
 	}
 
 	private async markCurrentProviderExhausted(
@@ -1197,6 +1317,7 @@ async function handleSubsAdd(pi: ExtensionAPI, ctx: ExtensionCommandContext, req
 	set.members.push(member);
 	if (!set.autoSwitch.strategy) set.autoSwitch.strategy = "quota-first";
 	saveGlobalConfig(config);
+	pi.registerProvider(createSelectionProvider(set));
 	registerEquivalentProvider(pi, providerName);
 	ctx.ui.notify(`Added ${providerName}. Authenticate it with /login ${providerName}.`, "info");
 }
@@ -1672,9 +1793,10 @@ export default function multiSub(pi: ExtensionAPI) {
 	registerConfiguredProviders(pi, loadGlobalConfig());
 
 	pi.on("session_start", async (_event, ctx) => {
+		const initialSelection = await runtime.handleInitialSelection(ctx.model, ctx);
 		const config = loadGlobalConfig();
 		const enabled = config.sets.filter((set) => set.autoSwitch.enabled);
-		if (enabled.length > 0) {
+		if (initialSelection === "not-requested" && enabled.length > 0) {
 			ctx.ui.setStatus("multi-pass", enabled.map((set) => `${set.id}:${set.autoSwitch.strategy}`).join(" | "));
 		}
 	});
