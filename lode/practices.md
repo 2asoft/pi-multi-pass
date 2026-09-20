@@ -9,6 +9,7 @@
 
 ## Executable behavior
 
+- Development dependencies target Pi 0.87.1. Verify account failover against the local Pi stack that provides extension-requested recovery retries and built-in provider instances.
 - List extension factory files explicitly in `package.json` under `pi.extensions`. Directory entries also load helper `.ts` files as extensions.
 - Add focused checks under `tests/` for selection and retry contracts.
 - Run `npm test` and `npm run typecheck` after the last executable edit.
