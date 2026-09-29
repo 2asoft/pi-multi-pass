@@ -7,8 +7,8 @@ pi-multi-pass is a Pi extension that registers equivalent OAuth accounts as prov
 - `extensions/multi-sub.ts` owns config parsing, provider registration, quota checks, dashboard workflows, and Pi event integration.
 - `extensions/provider-selection.ts` owns ordered bucket parsing and quota-first bucket decisions.
 - Global config is stored at `~/.pi/agent/multi-pass.json`. The project has no project-local runtime config.
-- A logical `multi-pass-<set-id>` provider lets CLI callers request a model without choosing a concrete account. During startup or in-session selection, the extension selects a bucketed account and preserves the model ID.
-- The extension reacts to quota-exhaustion errors from `message_end` and `compaction_error`, switches to an equivalent provider serving the same model ID, and requests a true retry.
+- Virtual models under `multi-pass-<set-id>` route to bucketed accounts while preserving the logical selection and model ID. Pi stores the chosen account in branch routing state and records the physical model on each response.
+- The extension reacts to quota-exhaustion errors from `message_end` and automatic `compaction_error`, suppresses the failed account, and requests a true retry. Virtual retries route to an equivalent account; concrete selections still switch providers.
 - Manual switching and account management use `/subs`.
 
 ## Governing constraints

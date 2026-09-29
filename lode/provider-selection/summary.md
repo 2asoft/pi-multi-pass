@@ -2,7 +2,7 @@
 
 ## Responsibility
 
-Provider selection chooses a concrete account for initial CLI routing and quota failover. It does not classify account plans, choose model IDs, or affect manual switching.
+Provider selection routes virtual models to concrete accounts and handles quota failover. It does not classify account plans, choose model IDs, or affect manual switching.
 
 ## Configuration contract
 
@@ -15,9 +15,13 @@ Provider selection chooses a concrete account for initial CLI routing and quota 
 - Normalization removes unknown members, repeated assignments, repeated bucket IDs, and empty buckets.
 - `members[].enabled` can suspend an assigned member without removing its placement.
 
-## Initial CLI routing
+## Virtual model routing
 
-Each set registers a logical provider named `multi-pass-<set-id>` with a static copy of the base provider's built-in model catalog. It has ambient internal auth, no login flow, and a local error stream instead of upstream request behavior. During `session_start` or the next `before_agent_start`, the extension replaces an explicitly requested logical model with a selected concrete member serving the same model ID. A concrete provider request bypasses initial selection. If selection cannot produce a target, the logical provider returns the routing error without an upstream model request.
+Each set registers virtual models under `multi-pass-<set-id>` using the base provider's built-in catalog IDs, limits, inputs, and thinking levels. Pi retains the virtual selection and dispatches physical requests through `registerVirtualModel`. There is no fake provider, credential, or local error stream.
+
+The router stores the chosen account in Pi's branch routing state and keeps it across turns while eligible. Retry requests prefer the failed account unless quota suppression excludes it. Direct requests, including compaction, follow the latest successful physical response when eligible; they have no branch routing state. If selection cannot produce a target, the router throws before any provider request.
+
+`message_end` identifies the failed physical account from its assistant message. For automatic compaction, the runtime remembers the physical target of the latest direct route because `compaction_error` carries no model. Quota recovery suppresses the failed account and asks Pi to retry through the router. Manual compaction does not emit this recovery hook. A concrete selection retains the existing account-switch behavior.
 
 ## Selection flow
 
@@ -40,5 +44,5 @@ After quota exhaustion, the failed provider is unavailable until the quota check
 - `extensions/provider-selection.ts`: config normalization and provider-neutral quota-first bucket planning.
 - `extensions/multi-sub.ts`: eligibility, quota checks, round-robin state, dashboard management, and retry integration.
 - `tests/provider-buckets-check.mjs`: logical provider naming, strict ordering, blocked-bucket advancement, and unknown-quota fallback.
-- `tests/logical-provider-check.mjs`: startup and in-session concrete selection plus local fail-closed behavior through Pi.
+- `tests/logical-provider-check.mjs` and `tests/fixtures/selector-provider.ts`: actual Pi RPC routing, stable virtual selection, local failures, and overload behavior; `PI_TEST_CLI` additionally exercises local account recovery, compaction recovery, and session restore without model API calls.
 - `README.md`: operator-facing configuration and behavior.

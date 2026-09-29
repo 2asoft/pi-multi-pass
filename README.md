@@ -8,6 +8,8 @@ Multi-subscription extension for [pi](https://github.com/earendil-works/pi-codin
 pi install git:github.com/2asoft/pi-multi-pass
 ```
 
+Requires Pi 0.99.0. Independent account instances and recovery retries require the local Pi stack's `sourceProvider`, `message_end` retry, and `compaction_error` APIs.
+
 ## Core idea
 
 A subscription set contains equivalent accounts for one provider, for example ChatGPT Codex:
@@ -49,19 +51,21 @@ The dashboard always refreshes quota and combines status, limits, bucket placeme
 
 ## CLI automatic selection
 
-Each configured set exposes a logical provider named `multi-pass-<set-id>`. Use it to select a concrete account from the configured buckets before Pi sends its first request:
+Each configured set exposes virtual models under `multi-pass-<set-id>`. Pi routes each request to a concrete account from the configured buckets:
 
 ```bash
 pi --model multi-pass-codex/gpt-5.6-sol
 ```
 
-The logical provider preserves the requested model ID. The extension applies the set's normal strategy and switches to the selected concrete provider during CLI startup or before the next request after an in-session model selection. It continues to use the same rules for later quota failover. Choosing a concrete provider bypasses initial selection:
+The virtual model preserves the requested model ID and stays selected in `/model`, extension contexts, and session history. Each response records its concrete account. The router keeps that account across turns while it remains eligible; Pi stores the account in routing state and restores it when resuming or forking the session. Quota failover chooses another account without changing the logical selection. Compaction uses the same router.
+
+Choosing a concrete provider bypasses initial selection:
 
 ```bash
 pi --model openai-codex-8/gpt-5.6-sol
 ```
 
-A logical provider has no user credential or login flow and cannot send an upstream model request. If automatic selection is disabled or no bucket has an available provider for the requested model, it returns a local routing error instead of using an unbucketed account.
+Virtual models have no credential or login flow. If automatic selection is disabled or no bucket has an available provider for the requested model, routing fails locally. Accounts outside all buckets remain available for manual switching.
 
 ## Prime subscription
 
@@ -148,7 +152,17 @@ Currently implemented:
 
 - `openai-codex`: fetches ChatGPT/Codex usage from `https://chatgpt.com/backend-api/wham/usage` or `CHATGPT_BASE_URL`.
 
-Automatic switching happens only after a runtime quota-exhaustion error, not server overload, capacity, or other non-quota errors. On pi versions that support `message_end` retry requests, automatic switching uses true retry instead of replaying the prompt.
+Automatic switching happens only after a runtime quota-exhaustion error. Server overload, capacity, and other errors keep the current account. Turn recovery uses `message_end` retry requests; automatic compaction recovery uses `compaction_error`. Manual compaction reports failures without that recovery hook.
+
+## Verification
+
+Run `npm run typecheck` and `npm test` against the pinned upstream SDK. To also verify account failover, automatic compaction recovery, and session restore against the local Pi stack:
+
+```bash
+PI_TEST_CLI=/path/to/pi-mono/packages/coding-agent/dist/cli.js npm test
+```
+
+The routing tests use local provider fixtures and make no model API requests.
 
 ## License
 

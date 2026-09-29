@@ -3,164 +3,178 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { spawn, spawnSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import { createInterface } from "node:readline";
 import { once } from "node:events";
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
-const pi = join(root, "node_modules", ".bin", "pi");
+const pi = process.env.PI_TEST_CLI || join(root, "node_modules", ".bin", "pi");
+const logicalProvider = "multi-pass-anthropic";
+const modelId = "claude-sonnet-4-6";
 
-function withAgentConfig(config, run) {
+async function withSession({ error, errors, autoCompact = false, enabled = true, buckets, cooldownMs = 300000, model = logicalProvider, sessionPath } = {}, run) {
   const agentDir = mkdtempSync(join(tmpdir(), "pi-multi-pass-"));
-  try {
-    writeFileSync(join(agentDir, "multi-pass.json"), JSON.stringify(config));
-    return run(agentDir);
-  } finally {
-    rmSync(agentDir, { recursive: true, force: true });
-  }
-}
-
-function setConfig({ id, baseProvider, providerName }) {
-  return {
+  writeFileSync(join(agentDir, "multi-pass.json"), JSON.stringify({
     sets: [{
-      id,
-      baseProvider,
-      members: [{ providerName, enabled: true }],
+      id: "anthropic",
+      baseProvider: "anthropic",
+      members: ["anthropic", "anthropic-2"].map((providerName) => ({ providerName, enabled: true })),
       autoSwitch: {
-        enabled: true,
-        strategy: "round-robin",
-        cooldownMs: 300000,
-        buckets: [{ id: "primary", members: [providerName] }],
+        enabled, strategy: "round-robin", cooldownMs,
+        buckets: buckets ?? [
+          { id: "primary", members: ["anthropic"] },
+          { id: "fallback", members: ["anthropic-2"] },
+        ],
       },
     }],
-  };
-}
-
-function runInitialSelectionCheck() {
-  const result = withAgentConfig(
-    setConfig({ id: "anthropic", baseProvider: "anthropic", providerName: "anthropic" }),
-    (agentDir) => spawnSync(pi, [
-      "--no-extensions",
-      "-e", root,
-      "--offline",
-      "--model", "multi-pass-anthropic/claude-sonnet-4-6",
-      "--mode", "rpc",
-      "--no-session",
-    ], {
-      cwd: root,
-      env: {
-        ...process.env,
-        ANTHROPIC_API_KEY: "unused-test-key",
-        PI_CODING_AGENT_DIR: agentDir,
-      },
-      input: `${JSON.stringify({ id: "state", type: "get_state" })}\n`,
-      encoding: "utf8",
-    }),
-  );
-
-  assert.equal(result.status, 0, result.stderr);
-  const response = result.stdout
-    .trim()
-    .split("\n")
-    .map((line) => JSON.parse(line))
-    .find((event) => event.id === "state");
-  assert.equal(response?.data?.model?.provider, "anthropic");
-  assert.equal(response?.data?.model?.id, "claude-sonnet-4-6");
-}
-
-async function runInSessionSelectionCheck() {
-  const agentDir = mkdtempSync(join(tmpdir(), "pi-multi-pass-"));
-  writeFileSync(
-    join(agentDir, "multi-pass.json"),
-    JSON.stringify(setConfig({ id: "anthropic", baseProvider: "anthropic", providerName: "anthropic" })),
-  );
+  }));
+  // "quota exhausted" requires the local extension retry signal. Overload stays terminal here.
+  writeFileSync(join(agentDir, "settings.json"), JSON.stringify({
+    retry: { enabled: error === "quota exhausted" || autoCompact, baseDelayMs: 1, maxDelayMs: 1, maxRetries: 2 },
+    compaction: { enabled: autoCompact, keepRecentTokens: 1 },
+  }));
   const child = spawn(pi, [
-    "--no-extensions",
-    "-e", root,
-    "--offline",
-    "--model", "anthropic/claude-sonnet-4-6",
-    "--mode", "rpc",
-    "--no-session",
+    "--no-extensions", "-e", root,
+    "-e", join(root, "tests/fixtures/selector-provider.ts"),
+    "--offline", "--mode", "rpc",
+    ...(sessionPath ? ["--session", sessionPath] : ["--model", `${model}/${modelId}`, "--session-dir", join(agentDir, "sessions")]),
   ], {
     cwd: root,
     env: {
-      ...process.env,
-      ANTHROPIC_API_KEY: "unused-test-key",
-      PI_CODING_AGENT_DIR: agentDir,
+      ...process.env, PI_CODING_AGENT_DIR: agentDir,
+      MULTI_PASS_TEST_ERRORS: JSON.stringify(errors ?? (error ? { 1: error } : {})),
     },
     stdio: ["pipe", "pipe", "pipe"],
   });
+  const exit = once(child, "exit");
   const lines = createInterface({ input: child.stdout });
+  const events = [];
+  const waiters = new Set();
   let stderr = "";
   child.stderr.setEncoding("utf8");
   child.stderr.on("data", (chunk) => { stderr += chunk; });
-
-  try {
-    const response = await new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => reject(new Error(`RPC timeout: ${stderr}`)), 10000);
-      lines.on("line", (line) => {
-        try {
-          const event = JSON.parse(line);
-          if (event.id === "set") {
-            assert.equal(event.success, true);
-            assert.equal(event.command, "set_model");
-            assert.equal(event.data?.provider, "multi-pass-anthropic");
-            child.stdin.write(`${JSON.stringify({ id: "prompt", type: "prompt", message: "test" })}\n`);
-          } else if (event.type === "extension_ui_request" && event.statusText === "anthropic via anthropic") {
-            child.stdin.write(`${JSON.stringify({ id: "state", type: "get_state" })}\n`);
-          } else if (event.id === "state") {
-            clearTimeout(timeout);
-            resolve(event);
-          }
-        } catch (error) {
-          clearTimeout(timeout);
-          reject(error);
+  lines.on("line", (line) => {
+    const event = JSON.parse(line);
+    events.push(event);
+    for (const waiter of waiters) waiter();
+  });
+  let commandId = 0;
+  function waitFor(predicate, start = 0) {
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        waiters.delete(check);
+        reject(new Error(`RPC timeout: ${stderr}\n${JSON.stringify(events.slice(start))}`));
+      }, 15000);
+      function check() {
+        const found = events.slice(start).find(predicate);
+        if (found) {
+          clearTimeout(timer);
+          waiters.delete(check);
+          resolve(found);
         }
-      });
-      child.once("error", reject);
-      child.once("exit", (code) => reject(new Error(`RPC exited ${code}: ${stderr}`)));
-      child.stdin.write(`${JSON.stringify({
-        id: "set",
-        type: "set_model",
-        provider: "multi-pass-anthropic",
-        modelId: "claude-sonnet-4-6",
-      })}\n`);
+      }
+      waiters.add(check);
+      check();
     });
-
-    assert.equal(response?.data?.model?.provider, "anthropic");
-    assert.equal(response?.data?.model?.id, "claude-sonnet-4-6");
+  }
+  async function command(type, data = {}) {
+    const id = String(++commandId);
+    child.stdin.write(`${JSON.stringify({ id, type, ...data })}\n`);
+    return waitFor((event) => event.id === id);
+  }
+  async function prompt() {
+    const start = events.length;
+    const response = await command("prompt", { message: "test" });
+    assert.equal(response.success, true, JSON.stringify(response));
+    await waitFor((event) => event.type === "agent_settled", start);
+    return events.slice(start).filter((event) => event.type === "message_end" && event.message.role === "assistant")
+      .map((event) => event.message);
+  }
+  try {
+    await run({ command, prompt, events });
   } finally {
     lines.close();
-    if (child.exitCode === null) {
-      child.kill();
-      await once(child, "exit");
-    }
+    if (child.exitCode === null) child.kill();
+    await exit;
     rmSync(agentDir, { recursive: true, force: true });
   }
 }
 
-function runFailClosedCheck() {
-  const result = withAgentConfig(
-    setConfig({ id: "codex", baseProvider: "openai-codex", providerName: "openai-codex" }),
-    (agentDir) => spawnSync(pi, [
-      "--no-extensions",
-      "-e", root,
-      "--offline",
-      "--model", "multi-pass-codex/gpt-5.6-sol",
-      "-p", "This request must fail locally.",
-    ], {
-      cwd: root,
-      env: { ...process.env, PI_CODING_AGENT_DIR: agentDir },
-      encoding: "utf8",
-    }),
-  );
+await withSession({}, async ({ command, prompt }) => {
+  const initial = await command("get_state");
+  assert.equal(initial.data.model.provider, logicalProvider);
+  assert.equal(initial.data.model.api, "pi-virtual");
+  for (let turn = 0; turn < 2; turn++) {
+    const messages = await prompt();
+    assert.equal(messages.at(-1).provider, "anthropic");
+    assert.equal(messages.at(-1).model, modelId);
+    assert.equal(messages.at(-1).stopReason, "stop");
+    assert.equal((await command("get_state")).data.model.provider, logicalProvider);
+  }
+});
 
-  assert.equal(result.status, 1);
-  assert.match(result.stderr, /Multi-pass could not route multi-pass-codex\/gpt-5\.6-sol/);
-  assert.equal(result.stdout, "");
+await withSession({ model: "anthropic" }, async ({ command, prompt }) => {
+  assert.equal((await prompt()).at(-1).provider, "anthropic");
+  assert.equal((await command("get_state")).data.model.provider, "anthropic");
+  assert.equal((await command("set_model", { provider: logicalProvider, modelId })).success, true);
+  assert.equal((await prompt()).at(-1).provider, "anthropic");
+  assert.equal((await command("get_state")).data.model.provider, logicalProvider);
+});
+
+for (const options of [{ enabled: false }, { buckets: [] }]) {
+  await withSession(options, async ({ command, prompt }) => {
+    const messages = await prompt();
+    assert.equal(messages.length, 1);
+    assert.equal(messages[0].stopReason, "error");
+    assert.match(messages[0].errorMessage, /Multi-pass could not route/);
+    assert.equal(messages[0].provider, logicalProvider);
+    assert.equal((await command("get_state")).data.model.provider, logicalProvider);
+  });
 }
 
-runInitialSelectionCheck();
-await runInSessionSelectionCheck();
-runFailClosedCheck();
-console.log("logical provider checks passed");
+await withSession({ error: "server overloaded" }, async ({ command, prompt }) => {
+  const messages = await prompt();
+  assert.equal(messages.length, 1);
+  assert.equal(messages[0].provider, "anthropic");
+  assert.equal(messages[0].stopReason, "error");
+  assert.equal((await command("get_state")).data.model.provider, logicalProvider);
+});
+
+// Recovery retries and independent provider instances are local Pi stack features.
+if (process.env.PI_TEST_CLI) {
+  for (const [model, cooldownMs] of [[logicalProvider, 300000], [logicalProvider, 0], ["anthropic", 300000]]) {
+    await withSession({ error: "quota exhausted", model, cooldownMs }, async ({ command, prompt }) => {
+      const messages = await prompt();
+      assert.deepEqual(messages.map((message) => message.provider), ["anthropic", "anthropic-2"]);
+      assert.equal(messages.at(-1).stopReason, "stop");
+      assert.equal((await command("get_state")).data.model.provider,
+        model === logicalProvider ? logicalProvider : "anthropic-2");
+      assert.equal((await prompt()).at(-1).provider, "anthropic-2");
+      if (model === logicalProvider) {
+        const sessionPath = (await command("get_state")).data.sessionFile;
+        assert.ok(sessionPath);
+        // A fresh host has no quota suppression or round-robin cursor; routing state must restore the account.
+        await withSession({ sessionPath }, async ({ command, prompt }) => {
+          assert.equal((await command("get_state")).data.model.provider, logicalProvider);
+          assert.equal((await prompt()).at(-1).provider, "anthropic-2");
+        });
+      }
+    });
+  }
+  await withSession({
+    autoCompact: true,
+    errors: { 3: "prompt is too long", 4: "quota exhausted" },
+  }, async ({ command, prompt, events }) => {
+    await prompt();
+    await prompt();
+    const messages = await prompt();
+    assert.equal(messages.at(-1).provider, "anthropic-2");
+    assert.equal(messages.at(-1).stopReason, "stop");
+    const compacted = events.find((event) => event.type === "compaction_end");
+    assert.match(compacted?.result?.summary ?? "", /response from anthropic-2/);
+    assert.equal((await command("get_state")).data.model.provider, logicalProvider);
+    assert.equal((await prompt()).at(-1).provider, "anthropic-2");
+  });
+}
+
+console.log(`virtual model checks passed${process.env.PI_TEST_CLI ? " (local recovery stack)" : ""}`);

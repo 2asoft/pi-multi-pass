@@ -8,5 +8,5 @@
     "skipLibCheck": true,
     "noEmit": true
   },
-  "include": ["extensions/**/*.ts", "pi-api.d.ts"]
+  "include": ["extensions/**/*.ts", "tests/fixtures/**/*.ts", "pi-api.d.ts"]
 }

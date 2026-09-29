@@ -27,20 +27,20 @@ import type {
 	ExtensionAPI,
 	ExtensionCommandContext,
 	ExtensionContext,
+	ModelRoute,
+	ModelRouteRequest,
 } from "@earendil-works/pi-coding-agent";
 import {
 	DynamicBorder,
 	getAgentDir,
 	keyHint,
 	readStoredCredential,
+	VIRTUAL_MODEL_STATE_ENTRY,
 } from "@earendil-works/pi-coding-agent";
 import {
-	createAssistantMessageEventStream,
+	getSupportedThinkingLevels,
 	type Api,
-	type AssistantMessage,
-	type AssistantMessageEventStream,
 	type Model,
-	type Provider,
 } from "@earendil-works/pi-ai";
 import { getBuiltinModels } from "@earendil-works/pi-ai/providers/all";
 import {
@@ -871,77 +871,20 @@ function registerEquivalentProvider(pi: ExtensionAPI, providerName: string): voi
 	});
 }
 
-function selectionProviderModels(baseProvider: string, providerName: string): Model<Api>[] {
-	const models = (() => {
-		switch (baseProvider) {
-			case "anthropic":
-				return getBuiltinModels("anthropic");
-			case "openai-codex":
-				return getBuiltinModels("openai-codex");
-			case "github-copilot":
-				return getBuiltinModels("github-copilot");
-			default:
-				return [];
-		}
-	})();
-	return models.map((model) => ({
-		...model,
-		provider: providerName,
-		baseUrl: "http://127.0.0.1",
-	}));
-}
-
-function selectionProviderErrorStream(model: Model<Api>): AssistantMessageEventStream {
-	const stream = createAssistantMessageEventStream();
-	queueMicrotask(() => {
-		const error: AssistantMessage = {
-			role: "assistant",
-			content: [],
-			api: model.api,
-			provider: model.provider,
-			model: model.id,
-			usage: {
-				input: 0,
-				output: 0,
-				cacheRead: 0,
-				cacheWrite: 0,
-				totalTokens: 0,
-				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-			},
-			stopReason: "error",
-			errorMessage: `Multi-pass could not route ${model.provider}/${model.id} to an available provider.`,
-			timestamp: Date.now(),
-		};
-		stream.push({ type: "error", reason: "error", error });
-	});
-	return stream;
-}
-
-function createSelectionProvider(set: EquivalentSet): Provider {
-	const providerName = selectionProviderName(set.id);
-	return {
-		id: providerName,
-		name: `Multi-pass selector: ${set.id}`,
-		baseUrl: "http://127.0.0.1",
-		auth: {
-			apiKey: {
-				name: `Multi-pass selector: ${set.id}`,
-				resolve: async () => ({
-					auth: { apiKey: "unused-selector-key" },
-					source: "multi-pass selector",
-				}),
-			},
-		},
-		getModels: () => selectionProviderModels(set.baseProvider, providerName),
-		stream: selectionProviderErrorStream,
-		streamSimple: selectionProviderErrorStream,
-	};
+function selectionModels(baseProvider: string): Model<Api>[] {
+	switch (baseProvider) {
+		case "anthropic":
+			return getBuiltinModels("anthropic");
+		case "openai-codex":
+			return getBuiltinModels("openai-codex");
+		case "github-copilot":
+			return getBuiltinModels("github-copilot");
+		default:
+			return [];
+	}
 }
 
 function registerConfiguredProviders(pi: ExtensionAPI, config: MultiPassConfig): void {
-	for (const set of config.sets) {
-		pi.registerProvider(createSelectionProvider(set));
-	}
 	for (const { member } of allMembers(config)) {
 		registerEquivalentProvider(pi, member.providerName);
 	}
@@ -1095,55 +1038,34 @@ function isQuotaExhaustionError(errorMessage: string): boolean {
 class EquivalentSetRuntime {
 	private readonly memberState = new Map<string, RuntimeMemberState>();
 	private readonly roundRobinIndex = new Map<string, number>();
-	private externalModelSelectionVersion = 0;
-	private latestExternalModel: Model<Api> | undefined;
-	private routingTarget: string | undefined;
+	private readonly registeredSelectors = new Set<string>();
+	// Direct requests have no router state. Retain their physical target for compaction_error.
+	private readonly directModels = new Map<string, { model: Model<Api>; failed: boolean }>();
+	private readonly pi: ExtensionAPI;
 
-	constructor(private readonly pi: ExtensionAPI) {}
-
-	private modelKey(model: Model<Api>): string {
-		return `${model.provider}\0${model.id}`;
+	constructor(pi: ExtensionAPI) {
+		this.pi = pi;
 	}
 
-	observeModelSelection(model: Model<Api>): void {
-		if (this.routingTarget === this.modelKey(model)) return;
-		this.externalModelSelectionVersion++;
-		this.latestExternalModel = model;
-	}
-
-	private async restoreLatestExternalSelection(ctx: ExtensionContext): Promise<void> {
-		while (this.latestExternalModel) {
-			const model = this.latestExternalModel;
-			const version = this.externalModelSelectionVersion;
-			if (ctx.model && this.modelKey(ctx.model) === this.modelKey(model)) return;
-			this.routingTarget = this.modelKey(model);
-			try {
-				if (!await this.pi.setModel(model)) return;
-			} finally {
-				this.routingTarget = undefined;
+	registerSelectors(config: MultiPassConfig): void {
+		for (const set of config.sets) {
+			const provider = selectionProviderName(set.id);
+			for (const model of selectionModels(set.baseProvider)) {
+				const key = `${provider}/${model.id}`;
+				if (this.registeredSelectors.has(key)) continue;
+				this.pi.registerVirtualModel<{ provider: string }>({
+					provider,
+					id: model.id,
+					name: model.name,
+					thinkingLevels: getSupportedThinkingLevels(model),
+					contextWindow: model.contextWindow,
+					maxTokens: model.maxTokens,
+					input: model.input,
+					route: (request, ctx) => this.route(request, ctx),
+				});
+				this.registeredSelectors.add(key);
 			}
-			if (this.externalModelSelectionVersion === version) return;
 		}
-	}
-
-	private async setModelUnlessSuperseded(
-		logicalModel: Model<Api>,
-		targetModel: Model<Api>,
-		ctx: ExtensionContext,
-	): Promise<"selected" | "superseded" | "failed"> {
-		const version = this.externalModelSelectionVersion;
-		if (!ctx.model || this.modelKey(ctx.model) !== this.modelKey(logicalModel)) return "superseded";
-		this.routingTarget = this.modelKey(targetModel);
-		let success: boolean;
-		try {
-			success = await this.pi.setModel(targetModel);
-		} finally {
-			this.routingTarget = undefined;
-		}
-		if (!success) return "failed";
-		if (this.externalModelSelectionVersion === version) return "selected";
-		await this.restoreLatestExternalSelection(ctx);
-		return "superseded";
 	}
 
 	markExhausted(providerName: string, cooldownMs: number, retryAt?: number): void {
@@ -1174,6 +1096,7 @@ class EquivalentSetRuntime {
 				return member.enabled
 					&& member.providerName !== currentModel.provider
 					&& model !== undefined
+					&& model.api !== "pi-virtual"
 					&& ctx.modelRegistry.hasConfiguredAuth(model)
 					&& !this.isExhausted(member.providerName);
 			})
@@ -1243,48 +1166,48 @@ class EquivalentSetRuntime {
 		return this.chooseRoundRobin(set, buckets[0].id, buckets[0].members);
 	}
 
-	async handleInitialSelection(
-		currentModel: Model<Api> | undefined,
+	private async route(
+		request: ModelRouteRequest<{ provider: string }>,
 		ctx: ExtensionContext,
-	): Promise<"not-requested" | "selected" | "unavailable"> {
-		if (!currentModel) return "not-requested";
-		const config = loadGlobalConfig();
-		const set = config.sets.find((candidate) =>
-			selectionProviderName(candidate.id) === currentModel.provider,
+	): Promise<ModelRoute<{ provider: string }>> {
+		const key = `${request.model.provider}/${request.model.id}`;
+		const direct = request.reason === "direct" ? this.directModels.get(key) : undefined;
+		if (request.reason === "direct") this.directModels.delete(key);
+		const set = loadGlobalConfig().sets.find((candidate) =>
+			selectionProviderName(candidate.id) === request.model.provider,
 		);
-		if (!set) return "not-requested";
-		if (!set.autoSwitch.enabled) {
-			ctx.ui.notify(`[subs:${set.id}] automatic selection is disabled`, "warning");
-			ctx.ui.setStatus("multi-pass", `${set.id}: disabled`);
-			return "unavailable";
+		if (!set || !set.autoSwitch.enabled || set.autoSwitch.strategy === "manual") {
+			throw new Error(`Multi-pass could not route ${key}: automatic selection is disabled.`);
 		}
-
-		const next = await this.chooseNext(set, currentModel, ctx);
-		if (!next) {
-			ctx.ui.notify(
-				`[subs:${set.id}] no available provider can serve ${currentModel.id}`,
-				"warning",
-			);
+		const failed = request.failed?.message.errorMessage
+			&& isQuotaExhaustionError(request.failed.message.errorMessage)
+			? request.failed.model
+			: direct?.failed ? direct.model : undefined;
+		const candidates = failed ?? request.model;
+		const eligible = new Set(this.eligibleBuckets(set, candidates, ctx)
+			.flatMap((bucket) => bucket.members.map((member) => member.providerName)));
+		// Keep the chosen account across turns and restore it from Pi's branch state.
+		// Direct requests (including compaction) instead follow the latest physical response.
+		const previous = request.reason === "direct" && request.previous?.model.id === request.model.id
+			? request.previous.model.provider
+			: request.state?.provider;
+		const preferred = request.failed?.model.provider ?? previous;
+		const provider = preferred && eligible.has(preferred)
+			? preferred
+			: (await this.chooseNext(set, candidates, ctx))?.providerName;
+		request.signal?.throwIfAborted();
+		const model = provider ? ctx.modelRegistry.find(provider, request.model.id) : undefined;
+		if (!model || model.api === "pi-virtual" || !ctx.modelRegistry.hasConfiguredAuth(model)) {
 			ctx.ui.setStatus("multi-pass", `${set.id}: unavailable`);
-			return "unavailable";
+			throw new Error(`Multi-pass could not route ${key} to an available provider.`);
 		}
-		const nextModel = ctx.modelRegistry.find(next.providerName, currentModel.id);
-		if (!nextModel) {
-			ctx.ui.notify(`[subs:${set.id}] failed to select ${next.providerName}`, "warning");
-			ctx.ui.setStatus("multi-pass", `${set.id}: unavailable`);
-			return "unavailable";
-		}
-		const selection = await this.setModelUnlessSuperseded(currentModel, nextModel, ctx);
-		if (selection === "superseded") return "not-requested";
-		if (selection === "failed") {
-			ctx.ui.notify(`[subs:${set.id}] failed to select ${next.providerName}`, "warning");
-			ctx.ui.setStatus("multi-pass", `${set.id}: unavailable`);
-			return "unavailable";
-		}
-
-		ctx.ui.notify(`[subs:${set.id}] selected ${next.providerName}`, "info");
-		ctx.ui.setStatus("multi-pass", `${set.id} via ${next.providerName}`);
-		return "selected";
+		if (request.reason === "direct") this.directModels.set(key, { model, failed: false });
+		ctx.ui.setStatus("multi-pass", `${set.id} via ${model.provider}`);
+		return {
+			model,
+			thinkingLevel: request.thinkingLevel,
+			state: request.state?.provider === model.provider ? request.state : { provider: model.provider },
+		};
 	}
 
 	private async markCurrentProviderExhausted(
@@ -1305,13 +1228,33 @@ class EquivalentSetRuntime {
 		this.markExhausted(currentProvider, set.autoSwitch.cooldownMs, result?.retryAt);
 	}
 
-	async handleRateLimit(errorMessage: string, currentModel: Model<Api> | undefined, ctx: ExtensionContext): Promise<boolean> {
-		if (!currentModel || !isQuotaExhaustionError(errorMessage)) return false;
+	async handleRateLimit(
+		errorMessage: string,
+		selectedModel: Model<Api> | undefined,
+		ctx: ExtensionContext,
+		failedModel?: Model<Api>,
+	): Promise<boolean> {
+		if (!selectedModel || !isQuotaExhaustionError(errorMessage)) return false;
 		const config = loadGlobalConfig();
-		const set = findSetForProvider(config, currentModel.provider);
-		if (!set || !set.autoSwitch.enabled) return false;
+		const virtual = selectedModel.api === "pi-virtual";
+		const set = virtual
+			? config.sets.find((candidate) => selectionProviderName(candidate.id) === selectedModel.provider)
+			: findSetForProvider(config, selectedModel.provider);
+		if (!set || !set.autoSwitch.enabled || set.autoSwitch.strategy === "manual") return false;
+		const currentModel = virtual
+			? failedModel ?? this.directModels.get(`${selectedModel.provider}/${selectedModel.id}`)?.model
+			: selectedModel;
+		if (!currentModel || currentModel.id !== selectedModel.id
+			|| !set.members.some((member) => member.providerName === currentModel.provider)) return false;
 
 		await this.markCurrentProviderExhausted(set, currentModel.provider);
+		if (virtual) {
+			// Pi retries the virtual selection; its router chooses the next account.
+			if (!failedModel) {
+				this.directModels.set(`${selectedModel.provider}/${selectedModel.id}`, { model: currentModel, failed: true });
+			}
+			return this.eligibleBuckets(set, currentModel, ctx).length > 0;
+		}
 		const next = await this.chooseNext(set, currentModel, ctx);
 		if (!next) {
 			ctx.ui.notify(`[subs:${set.id}] no available provider in the auto-switch buckets`, "warning");
@@ -1372,7 +1315,6 @@ async function handleSubsAdd(pi: ExtensionAPI, ctx: ExtensionCommandContext, req
 	set.members.push(member);
 	if (!set.autoSwitch.strategy) set.autoSwitch.strategy = "quota-first";
 	saveGlobalConfig(config);
-	pi.registerProvider(createSelectionProvider(set));
 	registerEquivalentProvider(pi, providerName);
 	ctx.ui.notify(`Added ${providerName}. Authenticate it with /login ${providerName}.`, "info");
 }
@@ -1390,6 +1332,20 @@ interface DashboardState {
 	members: DashboardMemberState[];
 }
 
+function currentProvider(ctx: ExtensionContext): string | undefined {
+	if (ctx.model?.api !== "pi-virtual") return ctx.model?.provider;
+	const branch = ctx.sessionManager.getBranch();
+	for (let index = branch.length - 1; index >= 0; index--) {
+		const entry = branch[index];
+		if (entry.type !== "custom" || entry.customType !== VIRTUAL_MODEL_STATE_ENTRY) continue;
+		const data = getRecord(entry.data);
+		if (data?.provider !== ctx.model.provider || data.modelId !== ctx.model.id) continue;
+		const state = getRecord(data.state);
+		return typeof state?.provider === "string" ? state.provider : undefined;
+	}
+	return undefined;
+}
+
 async function buildDashboardState(ctx: ExtensionCommandContext): Promise<DashboardState> {
 	const config = loadGlobalConfig();
 	const results = await runQuotaChecks(collectQuotaAccounts(ctx, config));
@@ -1400,7 +1356,7 @@ async function buildDashboardState(ctx: ExtensionCommandContext): Promise<Dashbo
 			set,
 			member,
 			authed: ctx.modelRegistry.hasAuth(member.providerName),
-			current: ctx.model?.provider === member.providerName,
+			current: currentProvider(ctx) === member.providerName,
 			quota: quotaByProvider.get(member.providerName),
 		})),
 	};
@@ -1559,7 +1515,7 @@ async function handleDashboardSetActions(ctx: ExtensionCommandContext, config: M
 		];
 		const action = await showWrappedSelect(ctx, {
 			title: `Set: ${set.id}`,
-			subtitle: formatDashboardSetDescription(set, set.members.map((member) => ({ set, member, authed: ctx.modelRegistry.hasAuth(member.providerName), current: ctx.model?.provider === member.providerName }))),
+			subtitle: formatDashboardSetDescription(set, set.members.map((member) => ({ set, member, authed: ctx.modelRegistry.hasAuth(member.providerName), current: currentProvider(ctx) === member.providerName }))),
 			items,
 			confirmHint: "apply",
 			cancelHint: "back",
@@ -1693,7 +1649,7 @@ async function handleSubsDashboard(pi: ExtensionAPI, ctx: ExtensionCommandContex
 			title: "Subscription Dashboard",
 			subtitle: "Quota refreshed. Select an account or set for actions.",
 			items: dashboardItems(state),
-			initialValue: ctx.model?.provider ? `member:${ctx.model.provider}` : undefined,
+			initialValue: currentProvider(ctx) ? `member:${currentProvider(ctx)}` : undefined,
 			confirmHint: "actions",
 			cancelHint: "close",
 		});
@@ -1781,7 +1737,7 @@ async function handleSubsSwitch(pi: ExtensionAPI, ctx: ExtensionCommandContext, 
 				label: member.providerName,
 				description: formatMemberLine(member, set, ctx.modelRegistry),
 			})),
-			initialValue: ctx.model?.provider,
+			initialValue: currentProvider(ctx),
 			confirmHint: "switch",
 		});
 	}
@@ -1845,23 +1801,15 @@ async function dispatchSubsCommand(pi: ExtensionAPI, ctx: ExtensionCommandContex
 
 export default function multiSub(pi: ExtensionAPI) {
 	const runtime = new EquivalentSetRuntime(pi);
-	registerConfiguredProviders(pi, loadGlobalConfig());
+	const config = loadGlobalConfig();
+	registerConfiguredProviders(pi, config);
+	runtime.registerSelectors(config);
 
-	pi.on("session_start", async (_event, ctx) => {
-		const initialSelection = await runtime.handleInitialSelection(ctx.model, ctx);
-		const config = loadGlobalConfig();
-		const enabled = config.sets.filter((set) => set.autoSwitch.enabled);
-		if (initialSelection === "not-requested" && enabled.length > 0) {
+	pi.on("session_start", (_event, ctx) => {
+		const enabled = loadGlobalConfig().sets.filter((set) => set.autoSwitch.enabled);
+		if (enabled.length > 0) {
 			ctx.ui.setStatus("multi-pass", enabled.map((set) => `${set.id}:${set.autoSwitch.strategy}`).join(" | "));
 		}
-	});
-
-	pi.on("model_select", (event) => {
-		runtime.observeModelSelection(event.model);
-	});
-
-	pi.on("before_agent_start", async (_event, ctx) => {
-		await runtime.handleInitialSelection(ctx.model, ctx);
 	});
 
 	pi.on("message_end", async (event, ctx) => {
@@ -1870,7 +1818,11 @@ export default function multiSub(pi: ExtensionAPI) {
 		if (assistant?.stopReason !== "error") return;
 		const errorMessage = typeof assistant.errorMessage === "string" ? assistant.errorMessage : undefined;
 		if (!errorMessage) return;
-		if (await runtime.handleRateLimit(errorMessage, ctx.model, ctx)) {
+		const failedModel = typeof assistant.provider === "string" && typeof assistant.model === "string"
+			? ctx.modelRegistry.find(assistant.provider, assistant.model)
+			: undefined;
+		if (!failedModel || failedModel.api === "pi-virtual") return;
+		if (await runtime.handleRateLimit(errorMessage, ctx.model, ctx, failedModel)) {
 			return { retry: true };
 		}
 	});
@@ -1892,7 +1844,8 @@ export default function multiSub(pi: ExtensionAPI) {
 			const parts = args.trim().split(/\s+/).filter(Boolean);
 			const command = (parts[0] || "").toLowerCase();
 			const rest = parts.slice(1).join(" ");
-			return dispatchSubsCommand(pi, ctx, command, rest);
+			await dispatchSubsCommand(pi, ctx, command, rest);
+			runtime.registerSelectors(loadGlobalConfig());
 		},
 	});
 }
