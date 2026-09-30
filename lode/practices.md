@@ -9,7 +9,7 @@
 
 ## Executable behavior
 
-- Development dependencies target Pi 0.99.0. Use upstream virtual models for logical selection; preserve physical account IDs on responses and logical IDs in session selection.
+- Development dependencies target Pi 1.0.3. Use upstream virtual models for logical selection; preserve physical account IDs on responses and logical IDs in session selection.
 - Run `PI_TEST_CLI=/path/to/pi-mono/packages/coding-agent/dist/cli.js npm test` to verify account failover, automatic compaction recovery, and session restore against the local stack's recovery retries and provider instances. Routing tests use local providers, never live credentials.
 - List extension factory files explicitly in `package.json` under `pi.extensions`. Directory entries also load helper `.ts` files as extensions.
 - Add focused checks under `tests/` for selection and retry contracts.
