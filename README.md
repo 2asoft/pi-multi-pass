@@ -8,7 +8,7 @@ Multi-subscription extension for [pi](https://github.com/earendil-works/pi-codin
 pi install git:github.com/2asoft/pi-multi-pass
 ```
 
-Requires the local Pi stack based on 1.0.3. Independent account instances and recovery retries require the local Pi stack's `sourceProvider`, `message_end` retry, and `compaction_error` APIs.
+Requires the local Pi stack based on 1.1.0. Independent account instances and recovery retries require the local Pi stack's `sourceProvider`, `message_end` retry, and `compaction_error` APIs.
 
 ## Core idea
 
